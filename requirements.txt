@@ -1,6 +1,5 @@
 aiogram==3.4.1
 pydantic<2.6
-easyocr==1.7.1
 python-dotenv==1.0.1
 pandas
 openpyxl

@@ -32,17 +32,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ── EasyOCR (lazy import to avoid crash if not installed) ──────────────────
-try:
-    import easyocr
-    logging.info("Loading EasyOCR models...")
-    reader = easyocr.Reader(['en', 'ar'])
-    logging.info("EasyOCR loaded.")
-    EASYOCR_AVAILABLE = True
-except Exception as e:
-    logging.warning(f"EasyOCR not available: {e}")
-    reader = None
-    EASYOCR_AVAILABLE = False
+# ── AI OCR Configuration ─────────────────────────────────────────────────────
+# EasyOCR and PyTorch dependencies have been removed to make the app lightweight.
+# We now use Gemini 2.5 Flash native multimodal capabilities for OCR.
 
 # database.init_db() is called in async main() below
 os.makedirs('temp', exist_ok=True)
@@ -773,37 +765,83 @@ async def handle_photo(message: Message, state: FSMContext):
     if user_id in pending_invoices:
         await message.answer("عندك فاتورة بتتعالج، خلصها الأول!")
         return
-    if not EASYOCR_AVAILABLE:
-        await message.answer("EasyOCR غير متاح. أضف المصروف يدوياً.")
-        return
-    proc = await message.answer("جاري قراءة الفاتورة... 🧐")
+        
+    proc = await message.answer("جاري قراءة الفاتورة وتحليلها... 🧐")
     local_path = f"temp/invoice_{user_id}_{message.message_id}.jpg"
     try:
         file = await bot.get_file(message.photo[-1].file_id)
         await bot.download_file(file.file_path, local_path)
-        await proc.edit_text("جاري استخراج النصوص... 🔍")
-        loop    = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, reader.readtext, local_path)
-        raw_text = "\n".join([r[1] for r in results])
-        if not raw_text.strip():
-            await proc.edit_text("الصورة مش واضحة، جرب تصورها تاني.")
+        await proc.edit_text("جاري استخراج البيانات بالذكاء الاصطناعي... 🔍")
+        
+        import base64
+        with open(local_path, "rb") as f:
+            image_data = base64.b64encode(f.read()).decode("utf-8")
+            
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            await proc.edit_text("مفتاح Gemini API مش متفعل.")
             return
-        date_match   = re.search(r'\b\d{1,4}[-/]\d{1,2}[-/]\d{1,4}\b', raw_text)
-        manual_date  = date_match.group(0) if date_match else "غير محدد"
-        total_match  = re.search(r'(الاجمالي|الإجمالي|إجمالي|صافي|Total|Net)[^\d]*([\d\.]+)',
-                                 raw_text.replace('\n', ' '), re.IGNORECASE)
-        manual_total = float(total_match.group(2)) if total_match else 0.0
-        pending_invoices[user_id] = {
-            'raw_text': raw_text, 'manual_total': manual_total,
-            'manual_date': manual_date, 'ai_input_text': raw_text
+
+        user_data = await database.get_user(user_id)
+        boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
+        
+        system = f"أنت محاسب AbsyCode لمركب '{boat_name}'. أجب بـ JSON فقط."
+        prompt = (f"You are an expert Arabic/English OCR analyst. Please analyze this invoice image. "
+                  f"Extract the full text (raw_text), total amount (total), date (date), and items if any. "
+                  f"Map the invoice to one of these categories: [بنزين, صيانة, ماركت, إكرامية, أدوات نظافة, عام] based on strict keyword mapping (e.g. fuel -> بنزين). "
+                  f'Return ONLY valid JSON format: {{"raw_text":"str","total":float,"date":"YYYY-MM-DD","category":"str","items":[{{"name":"str","price":float,"qty":int}}]}}')
+
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": f"{system}\\n\\n{prompt}"},
+                    {"inlineData": {"mimeType": "image/jpeg", "data": image_data}}
+                ]
+            }]
         }
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📂 تخزين كامل", callback_data="process_full")],
-            [InlineKeyboardButton(text="💰 إجمالي فقط",  callback_data="process_total")],
-        ])
-        await proc.edit_text(
-            f"📥 تم قراءة الفاتورة!\n💰 الإجمالي: {manual_total:,.2f} جنيه\n"
-            f"📅 التاريخ: {manual_date}\n\nاختار طريقة التخزين:", reply_markup=kb)
+        
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=20))
+        
+        if resp.status_code == 200:
+            data = resp.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                response_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                # Clean markdown blocks if present
+                if response_text.startswith("```json"):
+                    response_text = response_text[7:]
+                if response_text.startswith("```"):
+                    response_text = response_text[3:]
+                if response_text.endswith("```"):
+                    response_text = response_text[:-3]
+                
+                ai_data = json.loads(response_text.strip())
+                raw_text = ai_data.get("raw_text", "لم يتم التعرف على النص")
+                manual_total = float(ai_data.get("total", 0.0))
+                manual_date = ai_data.get("date", "غير محدد")
+                category = ai_data.get("category", "عام")
+                items = ai_data.get("items", [])
+                
+                pending_invoices[user_id] = {
+                    'raw_text': raw_text, 'manual_total': manual_total,
+                    'manual_date': manual_date, 'category': category,
+                    'items': items
+                }
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
+                ])
+                await proc.edit_text(
+                    f"📥 تم قراءة الفاتورة بنجاح!\n💰 الإجمالي: {manual_total:,.2f} جنيه\n"
+                    f"📅 التاريخ: {manual_date}\n🏷️ القسم: {category}\n📦 الأصناف: {len(items)}\n\nهل تريد الحفظ؟", reply_markup=kb)
+            else:
+                await proc.edit_text("لم أتمكن من استخراج البيانات، حاول بصورة أوضح.")
+        else:
+            logging.error(f"Gemini API Error: {resp.text}")
+            await proc.edit_text("حدث خطأ في الاتصال بالذكاء الاصطناعي.")
+            
+    except json.JSONDecodeError:
+        await proc.edit_text("حدث خطأ في فهم استجابة الذكاء الاصطناعي، يرجى المحاولة مرة أخرى.")
     except Exception as e:
         logging.error(f"Photo error: {e}")
         await proc.edit_text("حدث خطأ أثناء معالجة الصورة.")
@@ -811,27 +849,26 @@ async def handle_photo(message: Message, state: FSMContext):
         if os.path.exists(local_path):
             os.remove(local_path)
 
-@dp.callback_query(F.data.startswith("process_"))
-async def process_invoice_choice(callback: CallbackQuery):
+@dp.callback_query(F.data == "process_ai_direct")
+async def process_ai_direct_choice(callback: CallbackQuery):
     user_id = callback.from_user.id
     if user_id not in pending_invoices:
         await callback.answer("الفاتورة قديمة، ابعتها تاني.", show_alert=True)
         return
     data  = pending_invoices[user_id]
-    await callback.message.edit_text("جاري التنفيذ... 🧠")
+    await callback.message.edit_text("جاري الحفظ... 💾")
     try:
-        mode      = 'full_storage' if callback.data == "process_full" else 'total_only'
-        ai_result = analyze_with_ai(data['ai_input_text'], mode=mode)
-        items     = ai_result.get('items', []) if ai_result else []
-        best_amt  = data['manual_total'] if data['manual_total'] > 0 else (ai_result or {}).get('total', 0.0)
-        await database.save_invoice(user_id, best_amt, "جنيه", data['raw_text'], items=items)
+        best_amt  = data['manual_total']
+        items     = data.get('items', [])
+        category  = data.get('category', 'عام')
+        await database.save_invoice(user_id, best_amt, "جنيه", data['raw_text'], items=items, category=category)
         del pending_invoices[user_id]
         await callback.message.edit_text(
-            f"✅ تم حفظ الفاتورة!\n💰 الإجمالي: {best_amt:,.2f} جنيه\n"
-            f"📦 الأصناف: {len(items)}\nاستخدم /report لعرض التقرير.")
+            f"✅ تم حفظ الفاتورة بنجاح!\n💰 الإجمالي: {best_amt:,.2f} جنيه\n"
+            f"🏷️ القسم: {category}\n📦 الأصناف: {len(items)}\nاستخدم /report لعرض التقرير.")
     except Exception as e:
         logging.error(f"Process invoice error: {e}")
-        await callback.message.edit_text("حصل خطأ، جرب تاني.")
+        await callback.message.edit_text("حصل خطأ أثناء الحفظ، جرب تاني.")
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────
