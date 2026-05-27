@@ -917,10 +917,16 @@ async def handle_voice(message: Message, state: FSMContext):
 
         await wait_msg.edit_text("🔍 جاري استخراج بيانات الفاتورة بالذكاء الاصطناعي...")
 
-        # Encode audio as base64 for Gemini REST API (strip newlines for clean payload)
+        # Encode audio as base64 for Gemini REST API
+        # Gemini inlineData.data requires a 100% pure base64 string — no headers, no whitespace
         import base64
         with open(local_path, 'rb') as f:
-            audio_data = base64.b64encode(f.read()).decode("utf-8").replace("\n", "")
+            raw_b64 = base64.b64encode(f.read()).decode("utf-8")
+        # Strip data URI prefix if present (e.g. "data:audio/ogg;base64,...")
+        if ";base64," in raw_b64:
+            raw_b64 = raw_b64.split(";base64,", 1)[1]
+        # Remove any whitespace/newlines
+        audio_data = raw_b64.replace("\n", "").replace("\r", "").replace(" ", "").strip()
 
         user_data = await database.get_user(user_id)
         boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
