@@ -891,100 +891,156 @@ async def process_ai_direct_choice(callback: CallbackQuery):
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────
-# VOICE HANDLER — Invoice Registration via Gemini 2.5 Flash
+# VOICE HANDLER — Speech-to-Text → Confirm → Gemini Text Parsing
 # ─────────────────────────────────────────────────────────────
+pending_voice_transcripts: dict = {}
+
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
     user_id = message.from_user.id
 
-    # Prevent duplicate processing
     if user_id in pending_invoices:
         await message.answer("عندك فاتورة بتتعالج، خلصها الأول!")
         return
 
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_key:
-        await message.answer("مفتاح Gemini API مش متفعل.")
-        return
-
-    wait_msg = await message.answer("🎙️ جاري الاستماع وتحليل الرسالة الصوتية...")
-    local_path = f"temp/voice_{user_id}_{message.message_id}.ogg"
+    wait_msg = await message.answer("🎙️ جاري الاستماع للرسالة الصوتية...")
+    ogg_path = f"temp/voice_{user_id}_{message.message_id}.ogg"
+    wav_path = f"temp/voice_{user_id}_{message.message_id}.wav"
 
     try:
-        # Download voice file
+        # 1. Download voice file from Telegram
         voice_file = await bot.get_file(message.voice.file_id)
-        await bot.download_file(voice_file.file_path, local_path)
+        await bot.download_file(voice_file.file_path, ogg_path)
 
-        await wait_msg.edit_text("🔍 جاري استخراج بيانات الفاتورة بالذكاء الاصطناعي...")
+        await wait_msg.edit_text("🔄 جاري تحويل الصوت للنص...")
 
-        # Encode audio as base64 for Gemini REST API
-        # Gemini inlineData.data requires a 100% pure base64 string — no headers, no whitespace
-        import base64
-        with open(local_path, 'rb') as f:
-            raw_b64 = base64.b64encode(f.read()).decode("utf-8")
-        # Strip data URI prefix if present (e.g. "data:audio/ogg;base64,...")
-        if ";base64," in raw_b64:
-            raw_b64 = raw_b64.split(";base64,", 1)[1]
-        # Remove any whitespace/newlines
-        audio_data = raw_b64.replace("\n", "").replace("\r", "").replace(" ", "").strip()
+        # 2. Convert OGG/Opus → WAV using pydub (requires ffmpeg)
+        from pydub import AudioSegment
+        loop = asyncio.get_running_loop()
+        audio_segment = await loop.run_in_executor(
+            None, lambda: AudioSegment.from_ogg(ogg_path)
+        )
+        await loop.run_in_executor(
+            None, lambda: audio_segment.export(wav_path, format="wav")
+        )
+
+        # 3. Speech-to-text using Google's free web API (supports Arabic)
+        import speech_recognition as sr
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio_data = recognizer.record(source)
+
+        transcript = await loop.run_in_executor(
+            None,
+            lambda: recognizer.recognize_google(audio_data, language="ar-EG")
+        )
+
+        if not transcript or not transcript.strip():
+            await wait_msg.edit_text("مقدرتش أفهم الصوت، ممكن تحاول تاني بصوت أوضح؟ 🎤")
+            return
+
+        transcript = transcript.strip()
+
+        # 4. Store transcript and ask user to confirm
+        pending_voice_transcripts[user_id] = transcript
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ نعم، استخرج وسجل", callback_data="voice_confirm")],
+            [InlineKeyboardButton(text="❌ لا، إلغاء", callback_data="voice_cancel")],
+        ])
+        await wait_msg.edit_text(
+            f"🎙️ أنا سمعت:\n\n"
+            f"「{transcript}」\n\n"
+            f"هل هذا صحيح وتريد استخراج الفاتورة؟",
+            reply_markup=kb
+        )
+
+    except Exception as e:
+        # Handle speech_recognition specific errors
+        err_name = type(e).__name__
+        if err_name == "UnknownValueError":
+            await wait_msg.edit_text("مقدرتش أفهم الصوت، ممكن تحاول تاني بصوت أوضح؟ 🎤")
+        elif err_name == "RequestError":
+            logging.error(f"Google STT service error: {e}")
+            await wait_msg.edit_text("حدث خطأ في خدمة التعرف على الصوت. حاول تاني.")
+        else:
+            logging.error(f"Voice handler error: {e}")
+            traceback.print_exc()
+            await wait_msg.edit_text("حصل خطأ أثناء معالجة الرسالة الصوتية. ✍️")
+    finally:
+        for p in [ogg_path, wav_path]:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+
+@dp.callback_query(F.data == "voice_confirm")
+async def handle_voice_confirm(callback: CallbackQuery, state: FSMContext):
+    """User confirmed the transcript — send it to Gemini TEXT API for invoice parsing."""
+    user_id = callback.from_user.id
+    transcript = pending_voice_transcripts.pop(user_id, None)
+
+    if not transcript:
+        await callback.answer("انتهت صلاحية النص، ابعت الصوت تاني.", show_alert=True)
+        return
+
+    await callback.message.edit_text("🔍 جاري تحليل النص واستخراج بيانات الفاتورة...")
+
+    try:
+        gemini_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_key:
+            await callback.message.edit_text("مفتاح Gemini API مش متفعل.")
+            await callback.answer()
+            return
 
         user_data = await database.get_user(user_id)
         boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
 
         system = f"أنت محاسب AbsyCode لمركب '{boat_name}'. أجب بـ JSON فقط."
         prompt = (
-            "Listen carefully to this audio recording of a boat captain/admin describing an invoice or expense. "
-            "Extract: the full spoken text as raw_text, the total price (total), the date if mentioned (date, YYYY-MM-DD or 'غير محدد'), "
-            "and any line items with name, price, qty. "
-            "Categorize the invoice strictly into ONE of these categories based on keywords: "
-            "[بنزين, صيانة, ماركت, إكرامية, أدوات نظافة, عام]. "
-            "Examples: fuel/diesel/بنزين/سولار → بنزين, repair/تصليح/صيانة → صيانة, food/أكل/شرب/ماركت → ماركت, "
-            "tip/إكرامية → إكرامية, cleaning/نظافة → أدوات نظافة, otherwise → عام. "
-            'Return ONLY valid JSON: {"raw_text":"str","total":float,"date":"YYYY-MM-DD","category":"str","items":[{"name":"str","price":float,"qty":int}]}'
+            f"This is a transcribed voice note from a boat captain describing an expense or invoice.\n"
+            f"Transcribed text: \"{transcript}\"\n\n"
+            f"Extract: the full text as raw_text, the total price (total), the date if mentioned "
+            f"(date, YYYY-MM-DD or 'غير محدد'), and any line items with name, price, qty. "
+            f"Categorize strictly into ONE of: [بنزين, صيانة, ماركت, إكرامية, أدوات نظافة, عام]. "
+            f"Examples: fuel/بنزين/سولار → بنزين, repair/صيانة/تصليح → صيانة, "
+            f"food/أكل/شرب/ماركت → ماركت, tip/إكرامية → إكرامية, "
+            f"cleaning/نظافة → أدوات نظافة, otherwise → عام. "
+            f'Return ONLY valid JSON: {{"raw_text":"str","total":float,"date":"YYYY-MM-DD","category":"str","items":[{{"name":"str","price":float,"qty":int}}]}}'
         )
 
         url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={gemini_key}"
         payload = {
-            "contents": [{
-                "parts": [
-                    {"text": f"{system}\n\n{prompt}"},
-                    {"inlineData": {"mimeType": "audio/ogg", "data": audio_data}}
-                ]
-            }],
-            "generationConfig": {
-                "responseMimeType": "application/json"
-            }
+            "contents": [{"parts": [{"text": f"{system}\n\n{prompt}"}]}],
+            "generationConfig": {"responseMimeType": "application/json"}
         }
 
         loop = asyncio.get_running_loop()
-        try:
-            resp = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=30))
-        except requests.exceptions.RequestException as req_err:
-            logging.error(f"Gemini Voice request failed (network): {req_err}")
-            await wait_msg.edit_text("حدث خطأ في الاتصال بالسيرفر. تأكد من الإنترنت وحاول تاني.")
-            return
+        resp = await loop.run_in_executor(
+            None, lambda: requests.post(url, json=payload, timeout=20)
+        )
 
         if resp.status_code != 200:
-            # Detailed error logging for debugging
             try:
                 error_body = resp.json()
                 error_msg = error_body.get("error", {}).get("message", resp.text[:500])
                 error_status = error_body.get("error", {}).get("status", "UNKNOWN")
                 logging.error(
-                    f"Gemini Voice API Error {resp.status_code} [{error_status}]: {error_msg}\n"
-                    f"Full response: {resp.text[:1000]}"
+                    f"Gemini Voice-Text Error {resp.status_code} [{error_status}]: {error_msg}"
                 )
             except Exception:
-                logging.error(f"Gemini Voice API Error {resp.status_code} (raw): {resp.text[:1000]}")
-            await wait_msg.edit_text("حدث خطأ في الاتصال بالذكاء الاصطناعي. حاول تاني.")
+                logging.error(f"Gemini Voice-Text Error {resp.status_code}: {resp.text[:500]}")
+            await callback.message.edit_text("حدث خطأ في تحليل النص. حاول تاني.")
+            await callback.answer()
             return
 
         resp_data = resp.json()
         if "candidates" in resp_data and len(resp_data["candidates"]) > 0:
             response_text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-            # With responseMimeType=application/json, Gemini returns clean JSON.
-            # Safety fallback: strip markdown fences if present anyway.
+            # Safety fallback: strip markdown fences
             if response_text.startswith("```json"):
                 response_text = response_text[7:]
             if response_text.startswith("```"):
@@ -993,14 +1049,14 @@ async def handle_voice(message: Message, state: FSMContext):
                 response_text = response_text[:-3]
 
             ai_data = json.loads(response_text.strip())
-            raw_text = ai_data.get("raw_text", "رسالة صوتية")
+            raw_text = ai_data.get("raw_text", transcript)
             manual_total = float(ai_data.get("total", 0.0))
             manual_date = ai_data.get("date", "غير محدد")
             category = ai_data.get("category", "عام")
             items = ai_data.get("items", [])
             emoji = get_category_emoji(category)
 
-            # Store in pending_invoices for confirmation (same flow as photo)
+            # Store in pending_invoices → reuse existing process_ai_direct to save
             pending_invoices[user_id] = {
                 'raw_text': raw_text, 'manual_total': manual_total,
                 'manual_date': manual_date, 'category': category,
@@ -1010,30 +1066,36 @@ async def handle_voice(message: Message, state: FSMContext):
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
             ])
-            await wait_msg.edit_text(
+            await callback.message.edit_text(
                 f"🎙️ **تم تحليل الرسالة الصوتية بنجاح!**\n\n"
                 f"{emoji} القسم: {category}\n"
                 f"💰 الإجمالي: {manual_total:,.2f} جنيه\n"
                 f"📅 التاريخ: {manual_date}\n"
-                f"📦 الأصناف: {len(items)}\n"
-                f"📝 النص: _{raw_text[:100]}{'...' if len(raw_text) > 100 else ''}_\n\n"
+                f"📦 الأصناف: {len(items)}\n\n"
                 f"هل تريد حفظ الفاتورة؟",
                 reply_markup=kb,
                 parse_mode='Markdown'
             )
         else:
-            logging.warning(f"Gemini Voice: No candidates in response: {resp_data}")
-            await wait_msg.edit_text("مقدرتش أفهم الصوت، ممكن تحاول تاني بصوت أوضح؟ 🎤")
+            logging.warning(f"Gemini Voice-Text: No candidates: {resp_data}")
+            await callback.message.edit_text("مقدرتش أستخرج بيانات الفاتورة من النص. حاول تاني.")
 
     except json.JSONDecodeError:
-        await wait_msg.edit_text("حدث خطأ في فهم استجابة الذكاء الاصطناعي، حاول تاني بصوت أوضح. 🎤")
+        await callback.message.edit_text("حدث خطأ في فهم الاستجابة. حاول تاني.")
     except Exception as e:
-        logging.error(f"Voice handler error: {e}")
+        logging.error(f"Voice confirm error: {e}")
         traceback.print_exc()
-        await wait_msg.edit_text("حصل خطأ أثناء معالجة الرسالة الصوتية. ✍️")
-    finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
+        await callback.message.edit_text("حصل خطأ أثناء التحليل. حاول تاني.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "voice_cancel")
+async def handle_voice_cancel(callback: CallbackQuery, state: FSMContext):
+    """User rejected the transcript — clean up and dismiss."""
+    pending_voice_transcripts.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ تم إلغاء العملية.")
+    await callback.answer()
+
 
 # ─────────────────────────────────────────────────────────────
 # ADMIN PANEL (In-Bot Mobile Control)

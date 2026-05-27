@@ -8,3 +8,5 @@ ollama
 google-generativeai
 Pillow
 aiosqlite
+SpeechRecognition
+pydub

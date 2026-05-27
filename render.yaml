@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: absycode-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SUPER_ADMIN_ID
+        sync: false
+      - key: TRIAL_ACTIVATION_KEY
+        sync: false
