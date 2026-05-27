@@ -917,10 +917,10 @@ async def handle_voice(message: Message, state: FSMContext):
 
         await wait_msg.edit_text("🔍 جاري استخراج بيانات الفاتورة بالذكاء الاصطناعي...")
 
-        # Encode audio as base64 for Gemini REST API
+        # Encode audio as base64 for Gemini REST API (strip newlines for clean payload)
         import base64
         with open(local_path, 'rb') as f:
-            audio_data = base64.b64encode(f.read()).decode("utf-8")
+            audio_data = base64.b64encode(f.read()).decode("utf-8").replace("\n", "")
 
         user_data = await database.get_user(user_id)
         boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
@@ -941,62 +941,83 @@ async def handle_voice(message: Message, state: FSMContext):
         payload = {
             "contents": [{
                 "parts": [
-                    {"text": f"{system}\\n\\n{prompt}"},
+                    {"text": f"{system}\n\n{prompt}"},
                     {"inlineData": {"mimeType": "audio/ogg", "data": audio_data}}
                 ]
-            }]
+            }],
+            "generationConfig": {
+                "responseMimeType": "application/json"
+            }
         }
 
         loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=30))
+        try:
+            resp = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=30))
+        except requests.exceptions.RequestException as req_err:
+            logging.error(f"Gemini Voice request failed (network): {req_err}")
+            await wait_msg.edit_text("حدث خطأ في الاتصال بالسيرفر. تأكد من الإنترنت وحاول تاني.")
+            return
 
-        if resp.status_code == 200:
-            resp_data = resp.json()
-            if "candidates" in resp_data and len(resp_data["candidates"]) > 0:
-                response_text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-                # Clean markdown code blocks if present
-                if response_text.startswith("```json"):
-                    response_text = response_text[7:]
-                if response_text.startswith("```"):
-                    response_text = response_text[3:]
-                if response_text.endswith("```"):
-                    response_text = response_text[:-3]
-
-                ai_data = json.loads(response_text.strip())
-                raw_text = ai_data.get("raw_text", "رسالة صوتية")
-                manual_total = float(ai_data.get("total", 0.0))
-                manual_date = ai_data.get("date", "غير محدد")
-                category = ai_data.get("category", "عام")
-                items = ai_data.get("items", [])
-                emoji = get_category_emoji(category)
-
-                # Store in pending_invoices for confirmation (same flow as photo)
-                pending_invoices[user_id] = {
-                    'raw_text': raw_text, 'manual_total': manual_total,
-                    'manual_date': manual_date, 'category': category,
-                    'items': items
-                }
-
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
-                ])
-                await wait_msg.edit_text(
-                    f"🎙️ **تم تحليل الرسالة الصوتية بنجاح!**\n\n"
-                    f"{emoji} القسم: {category}\n"
-                    f"💰 الإجمالي: {manual_total:,.2f} جنيه\n"
-                    f"📅 التاريخ: {manual_date}\n"
-                    f"📦 الأصناف: {len(items)}\n"
-                    f"📝 النص: _{raw_text[:100]}{'...' if len(raw_text) > 100 else ''}_\n\n"
-                    f"هل تريد حفظ الفاتورة؟",
-                    reply_markup=kb,
-                    parse_mode='Markdown'
+        if resp.status_code != 200:
+            # Detailed error logging for debugging
+            try:
+                error_body = resp.json()
+                error_msg = error_body.get("error", {}).get("message", resp.text[:500])
+                error_status = error_body.get("error", {}).get("status", "UNKNOWN")
+                logging.error(
+                    f"Gemini Voice API Error {resp.status_code} [{error_status}]: {error_msg}\n"
+                    f"Full response: {resp.text[:1000]}"
                 )
-            else:
-                await wait_msg.edit_text("مقدرتش أفهم الصوت، ممكن تحاول تاني بصوت أوضح؟ 🎤")
-        else:
-            logging.error(f"Gemini Voice API Error {resp.status_code}: {resp.text}")
+            except Exception:
+                logging.error(f"Gemini Voice API Error {resp.status_code} (raw): {resp.text[:1000]}")
             await wait_msg.edit_text("حدث خطأ في الاتصال بالذكاء الاصطناعي. حاول تاني.")
+            return
+
+        resp_data = resp.json()
+        if "candidates" in resp_data and len(resp_data["candidates"]) > 0:
+            response_text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+            # With responseMimeType=application/json, Gemini returns clean JSON.
+            # Safety fallback: strip markdown fences if present anyway.
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+
+            ai_data = json.loads(response_text.strip())
+            raw_text = ai_data.get("raw_text", "رسالة صوتية")
+            manual_total = float(ai_data.get("total", 0.0))
+            manual_date = ai_data.get("date", "غير محدد")
+            category = ai_data.get("category", "عام")
+            items = ai_data.get("items", [])
+            emoji = get_category_emoji(category)
+
+            # Store in pending_invoices for confirmation (same flow as photo)
+            pending_invoices[user_id] = {
+                'raw_text': raw_text, 'manual_total': manual_total,
+                'manual_date': manual_date, 'category': category,
+                'items': items
+            }
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
+            ])
+            await wait_msg.edit_text(
+                f"🎙️ **تم تحليل الرسالة الصوتية بنجاح!**\n\n"
+                f"{emoji} القسم: {category}\n"
+                f"💰 الإجمالي: {manual_total:,.2f} جنيه\n"
+                f"📅 التاريخ: {manual_date}\n"
+                f"📦 الأصناف: {len(items)}\n"
+                f"📝 النص: _{raw_text[:100]}{'...' if len(raw_text) > 100 else ''}_\n\n"
+                f"هل تريد حفظ الفاتورة؟",
+                reply_markup=kb,
+                parse_mode='Markdown'
+            )
+        else:
+            logging.warning(f"Gemini Voice: No candidates in response: {resp_data}")
+            await wait_msg.edit_text("مقدرتش أفهم الصوت، ممكن تحاول تاني بصوت أوضح؟ 🎤")
 
     except json.JSONDecodeError:
         await wait_msg.edit_text("حدث خطأ في فهم استجابة الذكاء الاصطناعي، حاول تاني بصوت أوضح. 🎤")
