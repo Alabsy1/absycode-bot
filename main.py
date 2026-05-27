@@ -891,59 +891,120 @@ async def process_ai_direct_choice(callback: CallbackQuery):
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────
-# VOICE HANDLER
+# VOICE HANDLER — Invoice Registration via Gemini 2.5 Flash
 # ─────────────────────────────────────────────────────────────
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    # Prevent duplicate processing
+    if user_id in pending_invoices:
+        await message.answer("عندك فاتورة بتتعالج، خلصها الأول!")
+        return
+
     gemini_key = os.getenv("GEMINI_API_KEY")
     if not gemini_key:
-        await message.answer("مفتاح Gemini API مش متفعل."); return
-    wait_msg      = await message.answer("بحاول أسمع الملاحظة... 🎧")
-    local_path    = f"temp/voice_{message.from_user.id}_{message.message_id}.ogg"
-    current_state = await state.get_state()
+        await message.answer("مفتاح Gemini API مش متفعل.")
+        return
+
+    wait_msg = await message.answer("🎙️ جاري الاستماع وتحليل الرسالة الصوتية...")
+    local_path = f"temp/voice_{user_id}_{message.message_id}.ogg"
+
     try:
+        # Download voice file
         voice_file = await bot.get_file(message.voice.file_id)
         await bot.download_file(voice_file.file_path, local_path)
-        genai.configure(api_key=gemini_key)
+
+        await wait_msg.edit_text("🔍 جاري استخراج بيانات الفاتورة بالذكاء الاصطناعي...")
+
+        # Encode audio as base64 for Gemini REST API
+        import base64
         with open(local_path, 'rb') as f:
-            voice_bytes = f.read()
-        prompt = ('استمع واستخرج النية. مصروف: {"action":"expense","amount":float,"category":"str","currency":"str"}.'
-                  ' ملاحظة: {"action":"note","text":"str"}. JSON فقط.')
-        response = None
-        for m_name in ['gemini-1.5-flash', 'gemini-1.5-pro']:
-            try:
-                model    = genai.GenerativeModel(m_name)
-                response = model.generate_content(
-                    [{"mime_type": "audio/ogg", "data": voice_bytes}, prompt],
-                    request_options={"timeout": 15})
-                break
-            except Exception:
-                continue
-        if not response:
-            await wait_msg.edit_text("مقدرتش أحلل الصوت، ممكن تكتب لي؟ ✍️"); return
-        match = re.search(r'\{.*\}', response.text.strip(), re.DOTALL)
-        if not match:
-            await wait_msg.edit_text("مفهمتش الصوت، ممكن تكتب لي؟ ✍️"); return
-        data      = json.loads(match.group(0))
-        user_data = await database.get_user(message.from_user.id)
-        boat_name = user_data[2] if user_data and user_data[2] else "AbsyCode"
-        if data.get("action") == "expense" or current_state == MarineStates.waiting_for_expense_details.state:
-            amount   = data.get("amount", 0)
-            category = data.get("category", "عام")
-            currency = data.get("currency", "جنيه")
-            await database.save_invoice(message.from_user.id, amount, currency, f"صوتي: {category}", category=category)
-            await wait_msg.edit_text(f"✅ تم تسجيل {amount:,.2f} {currency} في '{category}' لمركب {boat_name}! 🛥️")
-        elif data.get("action") == "note":
-            note = data.get("text", "")
-            await database.save_trip_note(message.from_user.id, note)
-            await wait_msg.edit_text(f"✅ تم تسجيل الملحوظة:\n_{note}_", parse_mode='Markdown')
+            audio_data = base64.b64encode(f.read()).decode("utf-8")
+
+        user_data = await database.get_user(user_id)
+        boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
+
+        system = f"أنت محاسب AbsyCode لمركب '{boat_name}'. أجب بـ JSON فقط."
+        prompt = (
+            "Listen carefully to this audio recording of a boat captain/admin describing an invoice or expense. "
+            "Extract: the full spoken text as raw_text, the total price (total), the date if mentioned (date, YYYY-MM-DD or 'غير محدد'), "
+            "and any line items with name, price, qty. "
+            "Categorize the invoice strictly into ONE of these categories based on keywords: "
+            "[بنزين, صيانة, ماركت, إكرامية, أدوات نظافة, عام]. "
+            "Examples: fuel/diesel/بنزين/سولار → بنزين, repair/تصليح/صيانة → صيانة, food/أكل/شرب/ماركت → ماركت, "
+            "tip/إكرامية → إكرامية, cleaning/نظافة → أدوات نظافة, otherwise → عام. "
+            'Return ONLY valid JSON: {"raw_text":"str","total":float,"date":"YYYY-MM-DD","category":"str","items":[{"name":"str","price":float,"qty":int}]}'
+        )
+
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={gemini_key}"
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": f"{system}\\n\\n{prompt}"},
+                    {"inlineData": {"mimeType": "audio/ogg", "data": audio_data}}
+                ]
+            }]
+        }
+
+        loop = asyncio.get_running_loop()
+        resp = await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=30))
+
+        if resp.status_code == 200:
+            resp_data = resp.json()
+            if "candidates" in resp_data and len(resp_data["candidates"]) > 0:
+                response_text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+
+                # Clean markdown code blocks if present
+                if response_text.startswith("```json"):
+                    response_text = response_text[7:]
+                if response_text.startswith("```"):
+                    response_text = response_text[3:]
+                if response_text.endswith("```"):
+                    response_text = response_text[:-3]
+
+                ai_data = json.loads(response_text.strip())
+                raw_text = ai_data.get("raw_text", "رسالة صوتية")
+                manual_total = float(ai_data.get("total", 0.0))
+                manual_date = ai_data.get("date", "غير محدد")
+                category = ai_data.get("category", "عام")
+                items = ai_data.get("items", [])
+                emoji = get_category_emoji(category)
+
+                # Store in pending_invoices for confirmation (same flow as photo)
+                pending_invoices[user_id] = {
+                    'raw_text': raw_text, 'manual_total': manual_total,
+                    'manual_date': manual_date, 'category': category,
+                    'items': items
+                }
+
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
+                ])
+                await wait_msg.edit_text(
+                    f"🎙️ **تم تحليل الرسالة الصوتية بنجاح!**\n\n"
+                    f"{emoji} القسم: {category}\n"
+                    f"💰 الإجمالي: {manual_total:,.2f} جنيه\n"
+                    f"📅 التاريخ: {manual_date}\n"
+                    f"📦 الأصناف: {len(items)}\n"
+                    f"📝 النص: _{raw_text[:100]}{'...' if len(raw_text) > 100 else ''}_\n\n"
+                    f"هل تريد حفظ الفاتورة؟",
+                    reply_markup=kb,
+                    parse_mode='Markdown'
+                )
+            else:
+                await wait_msg.edit_text("مقدرتش أفهم الصوت، ممكن تحاول تاني بصوت أوضح؟ 🎤")
         else:
-            await wait_msg.edit_text("مفهمتش تقصد مصروف ولا ملحوظة. 😅")
+            logging.error(f"Gemini Voice API Error {resp.status_code}: {resp.text}")
+            await wait_msg.edit_text("حدث خطأ في الاتصال بالذكاء الاصطناعي. حاول تاني.")
+
+    except json.JSONDecodeError:
+        await wait_msg.edit_text("حدث خطأ في فهم استجابة الذكاء الاصطناعي، حاول تاني بصوت أوضح. 🎤")
     except Exception as e:
-        logging.error(f"Voice error: {e}")
-        await wait_msg.edit_text("حصل خطأ في معالجة الصوت. ✍️")
+        logging.error(f"Voice handler error: {e}")
+        traceback.print_exc()
+        await wait_msg.edit_text("حصل خطأ أثناء معالجة الرسالة الصوتية. ✍️")
     finally:
-        await state.clear()
         if os.path.exists(local_path):
             os.remove(local_path)
 
