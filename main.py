@@ -998,92 +998,108 @@ async def handle_voice_confirm(callback: CallbackQuery, state: FSMContext):
         user_data = await database.get_user(user_id)
         boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
 
-        system = f"أنت محاسب AbsyCode لمركب '{boat_name}'. أجب بـ JSON فقط."
-        prompt = (
-            f"This is a transcribed voice note from a boat captain describing an expense or invoice.\n"
+        system_msg = f"أنت محاسب AbsyCode لمركب '{boat_name}'. أجب بـ JSON فقط."
+        user_msg = (
+            "This is a transcribed voice note from a boat captain describing an expense or invoice.\n"
             f"Transcribed text: \"{transcript}\"\n\n"
-            f"Extract: the full text as raw_text, the total price (total), the date if mentioned "
-            f"(date, YYYY-MM-DD or 'غير محدد'), and any line items with name, price, qty. "
-            f"Categorize strictly into ONE of: [بنزين, صيانة, ماركت, إكرامية, أدوات نظافة, عام]. "
-            f"Examples: fuel/بنزين/سولار → بنزين, repair/صيانة/تصليح → صيانة, "
-            f"food/أكل/شرب/ماركت → ماركت, tip/إكرامية → إكرامية, "
-            f"cleaning/نظافة → أدوات نظافة, otherwise → عام. "
-            f'Return ONLY valid JSON: {{"raw_text":"str","total":float,"date":"YYYY-MM-DD","category":"str","items":[{{"name":"str","price":float,"qty":int}}]}}'
+            "Extract: the full text as raw_text, the total price (total), the date if mentioned "
+            "(date, YYYY-MM-DD or 'غير محدد'), and any line items with name, price, qty. "
+            "Categorize strictly into ONE of: [بنزين, صيانة, ماركت, إكرامية, أدوات نظافة, عام]. "
+            "Examples: fuel/بنزين/سولار → بنزين, repair/صيانة/تصليح → صيانة, "
+            "food/أكل/شرب/ماركت → ماركت, tip/إكرامية → إكرامية, "
+            "cleaning/نظافة → أدوات نظافة, otherwise → عام. "
+            'Return ONLY valid JSON: {"raw_text":"str","total":float,"date":"YYYY-MM-DD","category":"str","items":[{"name":"str","price":float,"qty":int}]}'
         )
+
+        full_prompt = system_msg + "\n\n" + user_msg
 
         url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={gemini_key}"
         payload = {
-            "contents": [{"parts": [{"text": f"{system}\n\n{prompt}"}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
+            "contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json"
+            }
         }
+
+        logging.info(f"Voice-Text: Sending transcript to Gemini ({len(transcript)} chars)")
 
         loop = asyncio.get_running_loop()
         resp = await loop.run_in_executor(
-            None, lambda: requests.post(url, json=payload, timeout=20)
+            None, lambda: requests.post(url, json=payload, timeout=25)
         )
+
+        logging.info(f"Voice-Text: Gemini responded with status {resp.status_code}")
 
         if resp.status_code != 200:
             try:
                 error_body = resp.json()
-                error_msg = error_body.get("error", {}).get("message", resp.text[:500])
+                error_msg = error_body.get("error", {}).get("message", "Unknown")
                 error_status = error_body.get("error", {}).get("status", "UNKNOWN")
                 logging.error(
-                    f"Gemini Voice-Text Error {resp.status_code} [{error_status}]: {error_msg}"
+                    f"Gemini Voice-Text Error {resp.status_code} [{error_status}]: {error_msg}\n"
+                    f"Full response: {resp.text[:1000]}"
                 )
             except Exception:
-                logging.error(f"Gemini Voice-Text Error {resp.status_code}: {resp.text[:500]}")
+                logging.error(f"Gemini Voice-Text Error {resp.status_code} (raw): {resp.text[:1000]}")
             await callback.message.edit_text("حدث خطأ في تحليل النص. حاول تاني.")
             await callback.answer()
             return
 
         resp_data = resp.json()
-        if "candidates" in resp_data and len(resp_data["candidates"]) > 0:
-            response_text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-
-            # Safety fallback: strip markdown fences
-            if response_text.startswith("```json"):
-                response_text = response_text[7:]
-            if response_text.startswith("```"):
-                response_text = response_text[3:]
-            if response_text.endswith("```"):
-                response_text = response_text[:-3]
-
-            ai_data = json.loads(response_text.strip())
-            raw_text = ai_data.get("raw_text", transcript)
-            manual_total = float(ai_data.get("total", 0.0))
-            manual_date = ai_data.get("date", "غير محدد")
-            category = ai_data.get("category", "عام")
-            items = ai_data.get("items", [])
-            emoji = get_category_emoji(category)
-
-            # Store in pending_invoices → reuse existing process_ai_direct to save
-            pending_invoices[user_id] = {
-                'raw_text': raw_text, 'manual_total': manual_total,
-                'manual_date': manual_date, 'category': category,
-                'items': items
-            }
-
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
-            ])
-            await callback.message.edit_text(
-                f"🎙️ **تم تحليل الرسالة الصوتية بنجاح!**\n\n"
-                f"{emoji} القسم: {category}\n"
-                f"💰 الإجمالي: {manual_total:,.2f} جنيه\n"
-                f"📅 التاريخ: {manual_date}\n"
-                f"📦 الأصناف: {len(items)}\n\n"
-                f"هل تريد حفظ الفاتورة؟",
-                reply_markup=kb,
-                parse_mode='Markdown'
-            )
-        else:
-            logging.warning(f"Gemini Voice-Text: No candidates: {resp_data}")
+        if "candidates" not in resp_data or len(resp_data["candidates"]) == 0:
+            logging.warning(f"Gemini Voice-Text: No candidates in response: {json.dumps(resp_data)[:500]}")
             await callback.message.edit_text("مقدرتش أستخرج بيانات الفاتورة من النص. حاول تاني.")
+            await callback.answer()
+            return
 
-    except json.JSONDecodeError:
+        response_text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        logging.info(f"Voice-Text: Raw Gemini response: {response_text[:300]}")
+
+        # Robust markdown fence stripping using regex
+        clean_text = re.sub(r'^```(?:json)?\s*', '', response_text)
+        clean_text = re.sub(r'\s*```$', '', clean_text)
+        clean_text = clean_text.strip()
+
+        # Fallback: extract first JSON object if there's extra text around it
+        if not clean_text.startswith('{'):
+            json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+            if json_match:
+                clean_text = json_match.group(0)
+
+        ai_data = json.loads(clean_text)
+        raw_text = ai_data.get("raw_text", transcript)
+        manual_total = float(ai_data.get("total", 0.0))
+        manual_date = ai_data.get("date", "غير محدد")
+        category = ai_data.get("category", "عام")
+        items = ai_data.get("items", [])
+        emoji = get_category_emoji(category)
+
+        # Store in pending_invoices → reuse existing process_ai_direct to save
+        pending_invoices[user_id] = {
+            'raw_text': raw_text, 'manual_total': manual_total,
+            'manual_date': manual_date, 'category': category,
+            'items': items
+        }
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
+        ])
+        await callback.message.edit_text(
+            f"🎙️ **تم تحليل الرسالة الصوتية بنجاح!**\n\n"
+            f"{emoji} القسم: {category}\n"
+            f"💰 الإجمالي: {manual_total:,.2f} جنيه\n"
+            f"📅 التاريخ: {manual_date}\n"
+            f"📦 الأصناف: {len(items)}\n\n"
+            f"هل تريد حفظ الفاتورة؟",
+            reply_markup=kb,
+            parse_mode='Markdown'
+        )
+
+    except json.JSONDecodeError as jde:
+        logging.error(f"Voice-Text JSON parse error: {jde}\nRaw text was: {response_text[:500] if 'response_text' in dir() else 'N/A'}")
         await callback.message.edit_text("حدث خطأ في فهم الاستجابة. حاول تاني.")
     except Exception as e:
-        logging.error(f"Voice confirm error: {e}")
+        logging.error(f"Voice confirm error: {type(e).__name__}: {e}")
         traceback.print_exc()
         await callback.message.edit_text("حصل خطأ أثناء التحليل. حاول تاني.")
     await callback.answer()
