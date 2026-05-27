@@ -220,8 +220,11 @@ async def handle_invoice_details_input(message: Message, state: FSMContext):
     invoice_id = await database.save_invoice(
         message.from_user.id, amount, "جنيه", text, category=category
     )
-    await state.clear()
     emoji = get_category_emoji(category)
+    continue_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ إضافة فاتورة أخرى", callback_data="inv_add_another")],
+        [InlineKeyboardButton(text="✅ إنهاء", callback_data="inv_finish")],
+    ])
     await message.answer(
         f"✅ **تم حفظ الفاتورة بنجاح!**\n\n"
         f"{emoji} القسم: {category}\n"
@@ -229,9 +232,25 @@ async def handle_invoice_details_input(message: Message, state: FSMContext):
         f"📝 التفاصيل: {text}\n"
         f"🆔 رقم الفاتورة: #{invoice_id}\n\n"
         f"رحلة سعيدة يا ريس! 🛥️",
-        reply_markup=get_main_menu(),
+        reply_markup=continue_kb,
         parse_mode='Markdown'
     )
+
+@dp.callback_query(F.data == "inv_add_another")
+async def handle_invoice_add_another(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(MarineStates.waiting_for_invoice_category)
+    await callback.message.edit_text(
+        "📂 اختر قسم الفاتورة:",
+        reply_markup=get_category_keyboard()
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "inv_finish")
+async def handle_invoice_finish(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("✅ تم الانتهاء من إدخال الفواتير. شغل جميل يا ريس! ⚓")
+    await callback.message.answer("اختر من القائمة:", reply_markup=get_main_menu())
+    await callback.answer()
 
 # ─────────────────────────────────────────────────────────────
 # REQ #3 — تعديل فاتورة  (Edit Invoice)
