@@ -529,6 +529,76 @@ async def get_detailed_report(user_id: int) -> list:
     return rows
 
 
+async def get_ledger_entries_paginated(user_id: int, offset: int = 0,
+                                       limit: int = 5) -> list:
+    """Returns full invoice rows for detailed ledger view, newest first.
+    Each row: (id, created_at, amount, currency, category, raw_text, image_file_id)
+    """
+    async with aiosqlite.connect(DB_NAME) as conn:
+        cursor = await conn.execute(
+            'SELECT id, created_at, amount, currency, category, raw_text, image_file_id '
+            'FROM invoices WHERE user_id=? ORDER BY created_at DESC '
+            'LIMIT ? OFFSET ?',
+            (user_id, limit, offset)
+        )
+        rows = await cursor.fetchall()
+    return rows
+
+
+async def merge_invoices(user_id: int, source_id: int, target_id: int) -> dict:
+    """Merges source invoice into target invoice.
+    - Sums amounts into target
+    - Appends raw_text from source to target
+    - Moves all invoice_items from source to target
+    - Deletes the source invoice row
+    - Writes 'Merged from ID #X' audit entry for full traceability
+    Returns dict with merged totals, or None if either invoice is missing.
+    """
+    async with aiosqlite.connect(DB_NAME) as conn:
+        cursor = await conn.execute(
+            'SELECT id, amount, currency, raw_text FROM invoices '
+            'WHERE id=? AND user_id=?', (source_id, user_id)
+        )
+        source = await cursor.fetchone()
+        cursor = await conn.execute(
+            'SELECT id, amount, currency, raw_text FROM invoices '
+            'WHERE id=? AND user_id=?', (target_id, user_id)
+        )
+        target = await cursor.fetchone()
+
+        if not source or not target:
+            return None
+
+        new_amount = (target[1] or 0) + (source[1] or 0)
+        target_text = target[3] or ""
+        source_text = source[3] or ""
+        merged_text = f"{target_text}\n---\n{source_text}" if target_text else source_text
+
+        await conn.execute(
+            'UPDATE invoices SET amount=?, raw_text=? WHERE id=? AND user_id=?',
+            (new_amount, merged_text, target_id, user_id)
+        )
+        await conn.execute(
+            'UPDATE invoice_items SET invoice_id=? WHERE invoice_id=?',
+            (target_id, source_id)
+        )
+        await conn.execute(
+            'DELETE FROM invoices WHERE id=? AND user_id=?',
+            (source_id, user_id)
+        )
+        await conn.commit()
+
+    await log_action(user_id, 'invoice_merged',
+                     f'Merged from ID #{source_id} into #{target_id}. '
+                     f'Source amount: {source[1]}, New combined total: {new_amount} {target[2]}')
+    return {
+        'target_id': target_id,
+        'source_id': source_id,
+        'new_amount': new_amount,
+        'currency': target[2] or 'جنيه'
+    }
+
+
 # ─────────────────────────────────────────────────────────────
 # TRIP NOTES
 # ─────────────────────────────────────────────────────────────

@@ -61,6 +61,12 @@ class MarineStates(StatesGroup):
     waiting_for_del_confirm       = State()
     # Admin panel
     admin_waiting_for_custom_expiry = State()
+    # v4.0 — Voice correction (user edits transcript before injection)
+    waiting_for_voice_correction  = State()
+    # v4.0 — Report inline editing (price/text edit from detailed report)
+    waiting_for_report_edit_value = State()
+    # v4.0 — Merge target selection
+    waiting_for_merge_target      = State()
 
 pending_approval_requests: set = set()
 pending_invoices: dict = {}
@@ -199,6 +205,37 @@ async def handle_add_invoice_menu(message: Message, state: FSMContext):
 async def handle_invoice_category_selected(callback: CallbackQuery, state: FSMContext):
     category = callback.data.replace("inv_cat_", "")
     await state.update_data(invoice_category=category)
+    data = await state.get_data()
+
+    # Voice shortcut: if transcript exists, auto-save instead of waiting for text
+    voice_text = data.get('voice_transcript')
+    if voice_text:
+        amount = _extract_amount(voice_text)
+        user_data = await database.get_user(callback.from_user.id)
+        boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
+        invoice_id = await database.save_invoice(
+            callback.from_user.id, amount, "جنيه", voice_text, category=category
+        )
+        await state.clear()
+        emoji = get_category_emoji(category)
+        continue_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ إضافة فاتورة أخرى", callback_data="inv_add_another")],
+            [InlineKeyboardButton(text="✅ إنهاء", callback_data="inv_finish")],
+        ])
+        await callback.message.edit_text(
+            f"✅ **تم حفظ الفاتورة من الرسالة الصوتية!**\n\n"
+            f"{emoji} القسم: {category}\n"
+            f"💰 المبلغ: {amount:,.2f} جنيه\n"
+            f"📝 التفاصيل: {voice_text}\n"
+            f"🆔 رقم الفاتورة: #{invoice_id}\n\n"
+            f"رحلة سعيدة يا ريس! 🛥️",
+            reply_markup=continue_kb,
+            parse_mode='Markdown'
+        )
+        await callback.answer()
+        return
+
+    # Normal manual flow: ask user to type details
     await state.set_state(MarineStates.waiting_for_invoice_details)
     emoji = get_category_emoji(category)
     await callback.message.edit_text(
@@ -480,27 +517,57 @@ async def del_cancel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────
-# REQ #5 — إضافة صورة الفاتورة  (Invoice Image)
+# REQ #5 — إضافة صورة الفاتورة  (Invoice Image) — v4.0 Paginated
 # ─────────────────────────────────────────────────────────────
+IMG_PAGE_SIZE = 5
+
 @dp.message(F.text == "📸 إضافة صورة الفاتورة")
 async def handle_add_image_menu(message: Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
-    invoices = await database.get_user_invoices_paginated(user_id, offset=0, limit=6)
-    if not invoices:
-        await message.answer("لا توجد فواتير مسجلة. أضف فاتورة أولاً.", reply_markup=get_main_menu())
+    await state.set_state(MarineStates.waiting_for_image_invoice_sel)
+    await _show_invoice_list_for_image(message, message.from_user.id, page=0)
+
+async def _show_invoice_list_for_image(target, user_id: int, page: int = 0):
+    """Paginated invoice selector for attaching images (5 per page)."""
+    total = await database.count_user_invoices(user_id)
+    is_bot_msg = hasattr(target, 'from_user') and target.from_user and target.from_user.is_bot
+    if total == 0:
+        text = "لا توجد فواتير مسجلة. أضف فاتورة أولاً."
+        if is_bot_msg:
+            await target.edit_text(text)
+        else:
+            await target.answer(text, reply_markup=get_main_menu())
         return
+    offset = page * IMG_PAGE_SIZE
+    invoices = await database.get_user_invoices_paginated(user_id, offset=offset, limit=IMG_PAGE_SIZE)
     buttons = []
     for inv_id, created_at, amount, currency, category in invoices:
         date_str = str(created_at)[:10]
         cat = category or "عام"
-        label = f"#{inv_id} | {date_str} | {amount:,.0f} | {cat}"
+        emoji = get_category_emoji(cat)
+        label = f"{emoji} #{inv_id} | {date_str} | {amount:,.0f} | {cat}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"img_inv_{inv_id}")])
-    await message.answer(
-        "📸 اختر الفاتورة التي تريد إرفاق صورة بها:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-    await state.set_state(MarineStates.waiting_for_image_invoice_sel)
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ السابق", callback_data=f"imgpage_{page-1}"))
+    if offset + IMG_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton(text="التالي ➡️", callback_data=f"imgpage_{page+1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    header = f"📸 اختر الفاتورة لإرفاق صورة ({total} فاتورة):"
+    if is_bot_msg:
+        await target.edit_text(header, reply_markup=kb)
+    else:
+        await target.answer(header, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("imgpage_"))
+async def handle_img_page(callback: CallbackQuery, state: FSMContext):
+    """Handle pagination for invoice image attachment list."""
+    page = int(callback.data.split("_")[1])
+    await _show_invoice_list_for_image(callback.message, callback.from_user.id, page=page)
+    await callback.answer()
 
 @dp.callback_query(MarineStates.waiting_for_image_invoice_sel, F.data.startswith("img_inv_"))
 async def handle_image_invoice_selected(callback: CallbackQuery, state: FSMContext):
@@ -611,20 +678,25 @@ def analyze_with_ai(input_text: str, mode: str = 'extract', boat_name: str = "م
         return "حصل خطأ بسيط، حاول تاني. 😅"
 
 # ─────────────────────────────────────────────────────────────
-# /report
+# /report  — v4.0 Detailed Ledger + CRUD Editing + Merge
 # ─────────────────────────────────────────────────────────────
+REPORT_PAGE_SIZE = 5
+
 @dp.message(Command("report"))
 @dp.message(F.text == "📊 التقارير")
 async def cmd_report(message: Message):
-    import html
-    user_id = message.from_user.id
+    await _show_report_page(message, message.from_user.id, page=0)
+
+async def _build_report_text(user_id: int) -> str:
+    """Build the category summary header text (HTML)."""
+    import html as html_mod
     user_data = await database.get_user(user_id)
     boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
     report_data = await database.get_detailed_report(user_id)
+    total_invoices = await database.count_user_invoices(user_id)
     if not report_data or (len(report_data) == 1 and report_data[0][1] is None):
-        await message.answer(f"لا توجد مصاريف مسجلة لمركب {html.escape(boat_name)} حتى الآن.")
-        return
-    msg = f"📊 <b>التقرير التفصيلي لـ {html.escape(boat_name)}:</b>\n\n"
+        return f"لا توجد مصاريف مسجلة لمركب {html_mod.escape(boat_name)} حتى الآن.", 0
+    msg = f"📊 <b>تقرير {html_mod.escape(boat_name)}:</b>\n\n"
     totals = {}
     for category, amount, currency in report_data:
         if amount is None:
@@ -632,12 +704,245 @@ async def cmd_report(message: Message):
         curr = currency or "جنيه"
         cat = category or "أخرى"
         emoji = get_category_emoji(category)
-        msg += f"{emoji} <b>{html.escape(cat)}</b>: {amount:,.2f} {html.escape(curr)}\n"
+        msg += f"{emoji} <b>{html_mod.escape(cat)}</b>: {amount:,.2f} {html_mod.escape(curr)}\n"
         totals[curr] = totals.get(curr, 0) + amount
-    msg += "\n" + "="*20 + "\n💰 <b>الإجمالي:</b>\n"
-    for curr, total in totals.items():
-        msg += f"🔹 {total:,.2f} {html.escape(curr)}\n"
-    await message.answer(msg, parse_mode='HTML')
+    msg += "\n" + "━"*18 + "\n💰 <b>الإجمالي:</b> "
+    parts = [f"{total:,.2f} {html_mod.escape(curr)}" for curr, total in totals.items()]
+    msg += " | ".join(parts)
+    msg += f"\n📋 <b>{total_invoices} فاتورة</b> — اضغط للتعديل:\n"
+    return msg, total_invoices
+
+async def _show_report_page(target, user_id: int, page: int = 0):
+    """Shows category summary + paginated ledger entries with edit buttons."""
+    header, total = await _build_report_text(user_id)
+    is_bot_msg = hasattr(target, 'from_user') and target.from_user and target.from_user.is_bot
+    if total == 0:
+        if is_bot_msg:
+            await target.edit_text(header, parse_mode='HTML')
+        else:
+            await target.answer(header, parse_mode='HTML')
+        return
+    # Fetch paginated ledger entries (newest first)
+    offset = page * REPORT_PAGE_SIZE
+    entries = await database.get_ledger_entries_paginated(user_id, offset=offset, limit=REPORT_PAGE_SIZE)
+    buttons = []
+    for inv_id, created_at, amount, currency, category, raw_text, image_file_id in entries:
+        date_str = str(created_at)[:10]
+        cat = category or "عام"
+        emoji = get_category_emoji(cat)
+        img_icon = "📸" if image_file_id else ""
+        label = f"{emoji} #{inv_id} | {date_str} | {amount:,.0f} {currency or 'ج'} {img_icon}"
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data=f"rpt_edit_{inv_id}"),
+        ])
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ السابق", callback_data=f"rptpage_{page-1}"))
+    if offset + REPORT_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton(text="التالي ➡️", callback_data=f"rptpage_{page+1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    if is_bot_msg:
+        await target.edit_text(header, reply_markup=kb, parse_mode='HTML')
+    else:
+        await target.answer(header, reply_markup=kb, parse_mode='HTML')
+
+@dp.callback_query(F.data.startswith("rptpage_"))
+async def handle_report_page(callback: CallbackQuery):
+    """Navigate report ledger pages."""
+    page = int(callback.data.split("_")[1])
+    await _show_report_page(callback.message, callback.from_user.id, page=page)
+    await callback.answer()
+
+# ── Report: Invoice Detail & Edit Sub-menu ────────────────────
+@dp.callback_query(F.data.startswith("rpt_edit_"))
+async def handle_report_edit_invoice(callback: CallbackQuery, state: FSMContext):
+    """Show invoice detail with edit/merge options from report view."""
+    inv_id = int(callback.data.replace("rpt_edit_", ""))
+    invoice = await database.get_invoice_by_id(inv_id, callback.from_user.id)
+    if not invoice:
+        await callback.answer("الفاتورة مش موجودة!", show_alert=True)
+        return
+    _, created_at, amount, currency, category, raw_text, image_file_id = invoice
+    date_str = str(created_at)[:10]
+    cat = category or "عام"
+    img_status = "✅ مرفقة" if image_file_id else "❌ لا توجد"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ تعديل المبلغ",    callback_data=f"rpt_edt_price_{inv_id}")],
+        [InlineKeyboardButton(text="📝 تعديل التفاصيل",  callback_data=f"rpt_edt_text_{inv_id}")],
+        [InlineKeyboardButton(text="🔗 دمج مع فاتورة أخرى", callback_data=f"rpt_merge_{inv_id}")],
+        [InlineKeyboardButton(text="🗑️ حذف الفاتورة",   callback_data=f"rpt_del_{inv_id}")],
+        [InlineKeyboardButton(text="🔙 رجوع للتقرير",    callback_data="rptpage_0")],
+    ])
+    await callback.message.edit_text(
+        f"📄 <b>تفاصيل الفاتورة #{inv_id}</b>\n\n"
+        f"📅 التاريخ: {date_str}\n"
+        f"🏷️ القسم: {cat}\n"
+        f"💰 المبلغ: {amount:,.2f} {currency or 'جنيه'}\n"
+        f"📝 التفاصيل: {raw_text or 'لا يوجد'}\n"
+        f"📸 الصورة: {img_status}\n\n"
+        "اختر ما تريد:",
+        reply_markup=kb, parse_mode='HTML'
+    )
+    await callback.answer()
+
+# ── Report: Edit Price / Text ─────────────────────────────────
+@dp.callback_query(F.data.startswith("rpt_edt_price_") | F.data.startswith("rpt_edt_text_"))
+async def handle_report_edit_field(callback: CallbackQuery, state: FSMContext):
+    """Start editing a field from the report detail view."""
+    parts = callback.data.split("_")
+    field = parts[2]   # "price" or "text"
+    inv_id = int(parts[3])
+    await state.set_state(MarineStates.waiting_for_report_edit_value)
+    await state.update_data(rpt_edit_inv_id=inv_id, rpt_edit_field=field)
+    prompt = "💰 اكتب المبلغ الجديد:" if field == "price" else "📝 اكتب التفاصيل الجديدة:"
+    await callback.message.edit_text(prompt)
+    await callback.answer()
+
+@dp.message(MarineStates.waiting_for_report_edit_value, F.text & ~F.text.startswith('/'))
+async def handle_report_edit_value_input(message: Message, state: FSMContext):
+    """Process the new value for report-based invoice editing."""
+    data = await state.get_data()
+    inv_id = data.get('rpt_edit_inv_id')
+    field  = data.get('rpt_edit_field')
+    text   = message.text.strip()
+    if field == 'price':
+        amount = _extract_amount(text)
+        await database.update_invoice(inv_id, message.from_user.id, amount=amount)
+        reply = f"✅ تم تحديث المبلغ إلى {amount:,.2f} جنيه للفاتورة #{inv_id}"
+    else:
+        await database.update_invoice(inv_id, message.from_user.id, raw_text=text)
+        reply = f"✅ تم تحديث تفاصيل الفاتورة #{inv_id}"
+    await state.clear()
+    await message.answer(reply, reply_markup=get_main_menu())
+
+# ── Report: Delete from report ────────────────────────────────
+@dp.callback_query(F.data.startswith("rpt_del_") & ~F.data.startswith("rpt_del_confirm_"))
+async def handle_report_delete_prompt(callback: CallbackQuery):
+    inv_id = int(callback.data.replace("rpt_del_", ""))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ نعم، احذف",  callback_data=f"rpt_del_confirm_{inv_id}"),
+        InlineKeyboardButton(text="❌ إلغاء",       callback_data="rptpage_0"),
+    ]])
+    await callback.message.edit_text(
+        f"⚠️ هل أنت متأكد من حذف الفاتورة #{inv_id}؟", reply_markup=kb
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("rpt_del_confirm_"))
+async def handle_report_delete_confirmed(callback: CallbackQuery):
+    inv_id = int(callback.data.replace("rpt_del_confirm_", ""))
+    success = await database.delete_invoice_by_id(inv_id, callback.from_user.id)
+    msg = f"✅ تم حذف الفاتورة #{inv_id}." if success else "❌ لم يتم العثور على الفاتورة."
+    await callback.message.edit_text(msg)
+    await callback.answer()
+
+# ── Report: Merge Invoices Flow ───────────────────────────────
+MERGE_PAGE_SIZE = 5
+
+@dp.callback_query(F.data.startswith("rpt_merge_") & ~F.data.startswith("rpt_merge_sel_") & ~F.data.startswith("rpt_merge_confirm_") & ~F.data.startswith("rpt_merge_pg_"))
+async def handle_merge_start(callback: CallbackQuery, state: FSMContext):
+    """Start the merge flow — show list of other invoices to merge into."""
+    source_id = int(callback.data.replace("rpt_merge_", ""))
+    await state.set_state(MarineStates.waiting_for_merge_target)
+    await state.update_data(merge_source_id=source_id)
+    await _show_merge_target_list(callback.message, callback.from_user.id, source_id, page=0)
+    await callback.answer()
+
+async def _show_merge_target_list(target, user_id: int, source_id: int, page: int = 0):
+    """Show paginated list of invoices to merge the source into (excluding source)."""
+    total = await database.count_user_invoices(user_id)
+    total_targets = total - 1  # exclude source
+    if total_targets <= 0:
+        await target.edit_text("لا توجد فواتير أخرى للدمج معها.")
+        return
+    offset = page * MERGE_PAGE_SIZE
+    all_inv = await database.get_user_invoices_paginated(user_id, offset=0, limit=200)
+    # Filter out the source invoice and apply manual pagination
+    targets = [(i, c, a, cu, cat) for i, c, a, cu, cat in all_inv if i != source_id]
+    page_targets = targets[offset:offset + MERGE_PAGE_SIZE]
+    buttons = []
+    for inv_id, created_at, amount, currency, category in page_targets:
+        date_str = str(created_at)[:10]
+        cat = category or "عام"
+        emoji = get_category_emoji(cat)
+        label = f"{emoji} #{inv_id} | {date_str} | {amount:,.0f} {currency or 'ج'}"
+        buttons.append([InlineKeyboardButton(
+            text=label, callback_data=f"rpt_merge_sel_{source_id}_{inv_id}"
+        )])
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ السابق", callback_data=f"rpt_merge_pg_{source_id}_{page-1}"))
+    if offset + MERGE_PAGE_SIZE < len(targets):
+        nav_row.append(InlineKeyboardButton(text="التالي ➡️", callback_data=f"rpt_merge_pg_{source_id}_{page+1}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="rptpage_0")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await target.edit_text(
+        f"🔗 <b>دمج الفاتورة #{source_id}</b>\n\n"
+        "اختر الفاتورة التي تريد الدمج فيها:",
+        reply_markup=kb, parse_mode='HTML'
+    )
+
+@dp.callback_query(F.data.startswith("rpt_merge_pg_"))
+async def handle_merge_page(callback: CallbackQuery, state: FSMContext):
+    """Navigate merge target list pages."""
+    # rpt_merge_pg_{source_id}_{page}
+    parts = callback.data.split("_")
+    source_id = int(parts[3])
+    page = int(parts[4])
+    await _show_merge_target_list(callback.message, callback.from_user.id, source_id, page=page)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("rpt_merge_sel_"))
+async def handle_merge_target_selected(callback: CallbackQuery, state: FSMContext):
+    """User selected a merge target — show confirmation."""
+    # rpt_merge_sel_{source_id}_{target_id}
+    parts = callback.data.split("_")
+    source_id = int(parts[3])
+    target_id = int(parts[4])
+    source = await database.get_invoice_by_id(source_id, callback.from_user.id)
+    target = await database.get_invoice_by_id(target_id, callback.from_user.id)
+    if not source or not target:
+        await callback.answer("فاتورة غير موجودة!", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ نعم، ادمج", callback_data=f"rpt_merge_confirm_{source_id}_{target_id}"),
+        InlineKeyboardButton(text="❌ إلغاء",     callback_data="rptpage_0"),
+    ]])
+    new_total = (source[2] or 0) + (target[2] or 0)
+    await callback.message.edit_text(
+        f"⚠️ <b>تأكيد الدمج</b>\n\n"
+        f"📤 الفاتورة #{source_id} ({source[2]:,.2f} {source[3] or 'جنيه'})\n"
+        f"📥 ← تُدمج في → الفاتورة #{target_id} ({target[2]:,.2f} {target[3] or 'جنيه'})\n\n"
+        f"💰 الإجمالي بعد الدمج: <b>{new_total:,.2f} {target[3] or 'جنيه'}</b>\n\n"
+        "⚠️ سيتم حذف الفاتورة المصدر بعد الدمج.",
+        reply_markup=kb, parse_mode='HTML'
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("rpt_merge_confirm_"))
+async def handle_merge_execute(callback: CallbackQuery, state: FSMContext):
+    """Execute the merge operation."""
+    # rpt_merge_confirm_{source_id}_{target_id}
+    parts = callback.data.split("_")
+    source_id = int(parts[3])
+    target_id = int(parts[4])
+    result = await database.merge_invoices(callback.from_user.id, source_id, target_id)
+    await state.clear()
+    if result:
+        await callback.message.edit_text(
+            f"✅ <b>تم الدمج بنجاح!</b>\n\n"
+            f"🔗 الفاتورة #{source_id} دُمجت في #{target_id}\n"
+            f"💰 الإجمالي الجديد: {result['new_amount']:,.2f} {result['currency']}",
+            parse_mode='HTML'
+        )
+    else:
+        await callback.message.edit_text("❌ حدث خطأ أثناء الدمج. تأكد أن الفواتير موجودة.")
+    await callback.answer()
 
 # ─────────────────────────────────────────────────────────────
 # /export  (with embedded invoice images)
@@ -891,9 +1196,26 @@ async def process_ai_direct_choice(callback: CallbackQuery):
     await callback.answer()
 
 # ─────────────────────────────────────────────────────────────
-# VOICE HANDLER — Speech-to-Text → Confirm → Gemini Text Parsing
+# VOICE HANDLER — v4.0 Interactive Voice-to-Text Textarea & Manual Injection
 # ─────────────────────────────────────────────────────────────
 pending_voice_transcripts: dict = {}
+
+def _build_voice_confirm_kb() -> InlineKeyboardMarkup:
+    """3-button inline keyboard for voice transcript confirmation."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="✅ نعم، حقن في الفاتورة المانويل",
+            callback_data="voice_inject"
+        )],
+        [InlineKeyboardButton(
+            text="✏️ تعديل النص أولاً",
+            callback_data="voice_edit_text"
+        )],
+        [InlineKeyboardButton(
+            text="❌ إلغاء العملية",
+            callback_data="voice_cancel"
+        )],
+    ])
 
 @dp.message(F.voice)
 async def handle_voice(message: Message, state: FSMContext):
@@ -941,18 +1263,17 @@ async def handle_voice(message: Message, state: FSMContext):
 
         transcript = transcript.strip()
 
-        # 4. Store transcript and ask user to confirm
+        # 4. Store transcript and present 3-option interactive keyboard
         pending_voice_transcripts[user_id] = transcript
+        amount = _extract_amount(transcript)
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ نعم، استخرج وسجل", callback_data="voice_confirm")],
-            [InlineKeyboardButton(text="❌ لا، إلغاء", callback_data="voice_cancel")],
-        ])
         await wait_msg.edit_text(
-            f"🎙️ أنا سمعت:\n\n"
-            f"「{transcript}」\n\n"
-            f"هل هذا صحيح وتريد استخراج الفاتورة؟",
-            reply_markup=kb
+            f"🎙️ أنا سمعت: `{transcript}`\n\n"
+            f"💰 المبلغ المستخرج: {amount:,.2f} جنيه\n\n"
+            "✍️ يمكنك تعديل النص أعلاه الآن إذا كان هناك خطأ، "
+            "أو اضغط على الأزرار لتأكيد وحقن البيانات.",
+            reply_markup=_build_voice_confirm_kb(),
+            parse_mode='Markdown'
         )
 
     except Exception as e:
@@ -976,9 +1297,12 @@ async def handle_voice(message: Message, state: FSMContext):
                     pass
 
 
-@dp.callback_query(F.data == "voice_confirm")
-async def handle_voice_confirm(callback: CallbackQuery, state: FSMContext):
-    """User confirmed the transcript — send it to Gemini TEXT API for invoice parsing."""
+@dp.callback_query(F.data == "voice_inject")
+async def handle_voice_inject(callback: CallbackQuery, state: FSMContext):
+    """Inject transcript directly into the manual invoice FSM flow.
+    Extracts amount via regex, routes to category selection, then
+    handle_invoice_category_selected picks up voice_transcript from state.
+    """
     user_id = callback.from_user.id
     transcript = pending_voice_transcripts.pop(user_id, None)
 
@@ -986,129 +1310,66 @@ async def handle_voice_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.answer("انتهت صلاحية النص، ابعت الصوت تاني.", show_alert=True)
         return
 
-    await callback.message.edit_text("🔍 جاري تحليل النص واستخراج بيانات الفاتورة...")
+    amount = _extract_amount(transcript)
 
-    try:
-        gemini_key = os.getenv("GEMINI_API_KEY")
-        if not gemini_key:
-            await callback.message.edit_text("مفتاح Gemini API مش متفعل.")
-            await callback.answer()
-            return
+    # Route into the stable manual invoice FSM: category → auto-save
+    await state.clear()
+    await state.set_state(MarineStates.waiting_for_invoice_category)
+    await state.update_data(voice_transcript=transcript, voice_amount=amount)
 
-        user_data = await database.get_user(user_id)
-        boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
-
-        system_msg = f"أنت محاسب AbsyCode لمركب '{boat_name}'. أجب بـ JSON فقط."
-        user_msg = (
-            "This is a transcribed voice note from a boat captain describing an expense or invoice.\n"
-            f"Transcribed text: \"{transcript}\"\n\n"
-            "Extract: the full text as raw_text, the total price (total), the date if mentioned "
-            "(date, YYYY-MM-DD or 'غير محدد'), and any line items with name, price, qty. "
-            "Categorize strictly into ONE of: [بنزين, صيانة, ماركت, إكرامية, أدوات نظافة, عام]. "
-            "Examples: fuel/بنزين/سولار → بنزين, repair/صيانة/تصليح → صيانة, "
-            "food/أكل/شرب/ماركت → ماركت, tip/إكرامية → إكرامية, "
-            "cleaning/نظافة → أدوات نظافة, otherwise → عام. "
-            'Return ONLY valid JSON: {"raw_text":"str","total":float,"date":"YYYY-MM-DD","category":"str","items":[{"name":"str","price":float,"qty":int}]}'
-        )
-
-        full_prompt = system_msg + "\n\n" + user_msg
-
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-        payload = {
-            "contents": [{"parts": [{"text": full_prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json"
-            }
-        }
-
-        logging.info(f"Voice-Text: Sending transcript to Gemini ({len(transcript)} chars)")
-
-        loop = asyncio.get_running_loop()
-        resp = await loop.run_in_executor(
-            None, lambda: requests.post(url, json=payload, timeout=25)
-        )
-
-        logging.info(f"Voice-Text: Gemini responded with status {resp.status_code}")
-
-        if resp.status_code != 200:
-            try:
-                error_body = resp.json()
-                error_msg = error_body.get("error", {}).get("message", "Unknown")
-                error_status = error_body.get("error", {}).get("status", "UNKNOWN")
-                logging.error(
-                    f"Gemini Voice-Text Error {resp.status_code} [{error_status}]: {error_msg}\n"
-                    f"Full response: {resp.text[:1000]}"
-                )
-            except Exception:
-                logging.error(f"Gemini Voice-Text Error {resp.status_code} (raw): {resp.text[:1000]}")
-            await callback.message.edit_text("حدث خطأ في تحليل النص. حاول تاني.")
-            await callback.answer()
-            return
-
-        resp_data = resp.json()
-        if "candidates" not in resp_data or len(resp_data["candidates"]) == 0:
-            logging.warning(f"Gemini Voice-Text: No candidates in response: {json.dumps(resp_data)[:500]}")
-            await callback.message.edit_text("مقدرتش أستخرج بيانات الفاتورة من النص. حاول تاني.")
-            await callback.answer()
-            return
-
-        response_text = resp_data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        logging.info(f"Voice-Text: Raw Gemini response: {response_text[:300]}")
-
-        # Robust markdown fence stripping using regex
-        clean_text = re.sub(r'^```(?:json)?\s*', '', response_text)
-        clean_text = re.sub(r'\s*```$', '', clean_text)
-        clean_text = clean_text.strip()
-
-        # Fallback: extract first JSON object if there's extra text around it
-        if not clean_text.startswith('{'):
-            json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
-            if json_match:
-                clean_text = json_match.group(0)
-
-        ai_data = json.loads(clean_text)
-        raw_text = ai_data.get("raw_text", transcript)
-        manual_total = float(ai_data.get("total", 0.0))
-        manual_date = ai_data.get("date", "غير محدد")
-        category = ai_data.get("category", "عام")
-        items = ai_data.get("items", [])
-        emoji = get_category_emoji(category)
-
-        # Store in pending_invoices → reuse existing process_ai_direct to save
-        pending_invoices[user_id] = {
-            'raw_text': raw_text, 'manual_total': manual_total,
-            'manual_date': manual_date, 'category': category,
-            'items': items
-        }
-
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📂 حفظ الفاتورة", callback_data="process_ai_direct")]
-        ])
-        await callback.message.edit_text(
-            f"🎙️ **تم تحليل الرسالة الصوتية بنجاح!**\n\n"
-            f"{emoji} القسم: {category}\n"
-            f"💰 الإجمالي: {manual_total:,.2f} جنيه\n"
-            f"📅 التاريخ: {manual_date}\n"
-            f"📦 الأصناف: {len(items)}\n\n"
-            f"هل تريد حفظ الفاتورة؟",
-            reply_markup=kb,
-            parse_mode='Markdown'
-        )
-
-    except json.JSONDecodeError as jde:
-        logging.error(f"Voice-Text JSON parse error: {jde}\nRaw text was: {response_text[:500] if 'response_text' in dir() else 'N/A'}")
-        await callback.message.edit_text("حدث خطأ في فهم الاستجابة. حاول تاني.")
-    except Exception as e:
-        logging.error(f"Voice confirm error: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        await callback.message.edit_text("حصل خطأ أثناء التحليل. حاول تاني.")
+    await callback.message.edit_text(
+        f"🎙️ **تم التعرف على النص:**\n\n"
+        f"📝 \"{transcript}\"\n"
+        f"💰 المبلغ المستخرج: {amount:,.2f} جنيه\n\n"
+        f"📂 اختر قسم الفاتورة:",
+        reply_markup=get_category_keyboard(),
+        parse_mode='Markdown'
+    )
     await callback.answer()
+
+
+@dp.callback_query(F.data == "voice_edit_text")
+async def handle_voice_edit_text(callback: CallbackQuery, state: FSMContext):
+    """Put the bot in correction state — user types the corrected text."""
+    user_id = callback.from_user.id
+    transcript = pending_voice_transcripts.get(user_id)
+    if not transcript:
+        await callback.answer("انتهت صلاحية النص، ابعت الصوت تاني.", show_alert=True)
+        return
+
+    await state.set_state(MarineStates.waiting_for_voice_correction)
+    await callback.message.edit_text(
+        f"✏️ **النص الحالي:**\n`{transcript}`\n\n"
+        "اكتب النص الصحيح الآن وسأعيد عرض الخيارات:",
+        parse_mode='Markdown'
+    )
+    await callback.answer()
+
+
+@dp.message(MarineStates.waiting_for_voice_correction, F.text & ~F.text.startswith('/'))
+async def handle_voice_correction_input(message: Message, state: FSMContext):
+    """User typed the corrected transcript. Store it and re-show the 3-button keyboard."""
+    user_id = message.from_user.id
+    corrected = message.text.strip()
+    pending_voice_transcripts[user_id] = corrected
+    amount = _extract_amount(corrected)
+
+    await state.clear()  # Clear correction state, back to neutral
+    await message.answer(
+        f"🎙️ أنا سمعت: `{corrected}`\n\n"
+        f"💰 المبلغ المستخرج: {amount:,.2f} جنيه\n\n"
+        "✍️ يمكنك تعديل النص أعلاه الآن إذا كان هناك خطأ، "
+        "أو اضغط على الأزرار لتأكيد وحقن البيانات.",
+        reply_markup=_build_voice_confirm_kb(),
+        parse_mode='Markdown'
+    )
 
 
 @dp.callback_query(F.data == "voice_cancel")
 async def handle_voice_cancel(callback: CallbackQuery, state: FSMContext):
-    """User rejected the transcript — clean up and dismiss."""
+    """User cancelled the voice operation — clean up and dismiss."""
     pending_voice_transcripts.pop(callback.from_user.id, None)
+    await state.clear()
     await callback.message.edit_text("❌ تم إلغاء العملية.")
     await callback.answer()
 
@@ -1439,37 +1700,104 @@ async def process_finance_choice(callback: CallbackQuery, state: FSMContext):
         await cmd_report(callback.message)
     await callback.answer()
 
+
 @dp.message(F.text == "🌤️ حالة البحر")
 async def handle_weather(message: Message):
+    """v4.0 — Full daily marine weather forecast with hourly breakdown."""
     user_data = await database.get_user(message.from_user.id)
     boat_name = user_data[2] if user_data and user_data[2] else "مركب غير مسمى"
-    wait_msg  = await message.answer("جاري استطلاع حالة البحر... 🔭")
-    lat, lon  = 27.25, 33.81
+    wait_msg  = await message.answer("جاري استطلاع حالة البحر على مدار اليوم... 🔭")
+    lat, lon  = 27.25, 33.81   # Hurghada / Red Sea default
     api_key   = os.getenv("OPENWEATHER_API_KEY", "")
     try:
-        url  = (f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}"
-                f"&appid={api_key}&units=metric&lang=ar")
-        data = requests.get(url, timeout=5).json()
-        temp       = data['main']['temp']
-        wind_knots = data['wind']['speed'] * 1.94384
-        desc       = data['weather'][0]['description']
-        suitability = ("البحر هادي ومثالي للرحلات 🛥️✨" if wind_knots < 10
-                       else "جو مناسب للإبحار 🌊" if wind_knots < 20
-                       else "الرياح قوية، احتاط يا ريس ⚠️")
-                       
-        raw_text = (f"☀️ تقرير البحر — {boat_name}\\n\\n"
-                    f"🌡️ {temp:.1f}°C  |  🌬️ {wind_knots:.1f} عقدة\\n"
-                    f"☁️ {desc}\\n\\n💎 {suitability}")
-                    
-        # AI Formatting
+        loop = asyncio.get_running_loop()
+        # Current weather snapshot
+        current_url = (f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}"
+                       f"&appid={api_key}&units=metric&lang=ar")
+        current_data = await loop.run_in_executor(
+            None, lambda: requests.get(current_url, timeout=5).json()
+        )
+        curr_temp = current_data['main']['temp']
+        curr_wind_ms = current_data['wind']['speed']
+        curr_wind_knots = curr_wind_ms * 1.94384
+        curr_desc = current_data['weather'][0]['description']
+        curr_wave_h, curr_wave_desc = _estimate_wave_height(curr_wind_knots)
+        curr_safety = _marine_safety(curr_wind_knots)
+
+        # 3-hour forecast for full day breakdown
+        forecast_url = (f"https://api.openweathermap.org/data/2.5/forecast?lat={lat}&lon={lon}"
+                        f"&appid={api_key}&units=metric&lang=ar")
+        forecast_resp = await loop.run_in_executor(
+            None, lambda: requests.get(forecast_url, timeout=5).json()
+        )
+
+        # Build report header
+        raw_text = (f"⚓ تقرير البحر — {boat_name}\n"
+                    + "━"*20 + "\n\n"
+                    f"📍 الحالة الآن:\n"
+                    f"🌡️ {curr_temp:.1f}°C  |  🌬️ {curr_wind_knots:.1f} عقدة\n"
+                    f"🌊 ارتفاع الموج: ~{curr_wave_h:.1f}م ({curr_wave_desc})\n"
+                    f"☁️ {curr_desc}\n"
+                    f"💎 {curr_safety}\n\n"
+                    + "━"*20 + "\n"
+                    f"📊 التوقعات على مدار اليوم:\n\n")
+
+        # Parse forecast — group today's entries into 4 periods
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        tomorrow_str = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+        period_defs = [
+            ("الصباح ☀️ (06:00–12:00)", 6, 12),
+            ("الظهر 🌤️ (12:00–18:00)", 12, 18),
+            ("المساء 🌅 (18:00–00:00)", 18, 24),
+            ("الليل 🌙 (00:00–06:00)", 0, 6),
+        ]
+        periods = {name: [] for name, _, _ in period_defs}
+
+        for entry in forecast_resp.get('list', []):
+            dt_txt = entry.get('dt_txt', '')
+            is_today = dt_txt.startswith(today_str)
+            is_tomorrow_night = (dt_txt.startswith(tomorrow_str) and int(dt_txt[11:13]) < 6)
+            if not is_today and not is_tomorrow_night:
+                continue
+            hour = int(dt_txt[11:13])
+            temp = entry['main']['temp']
+            wind_knots = entry['wind']['speed'] * 1.94384
+            desc = entry['weather'][0]['description']
+            wave_h, wave_desc = _estimate_wave_height(wind_knots)
+            pd_entry = {'time': dt_txt[11:16], 'temp': temp,
+                        'wind_knots': wind_knots, 'desc': desc,
+                        'wave_h': wave_h, 'wave_desc': wave_desc}
+            for p_name, p_start, p_end in period_defs:
+                if p_start <= hour < p_end:
+                    periods[p_name].append(pd_entry)
+                    break
+
+        for p_name, _, _ in period_defs:
+            p_entries = periods[p_name]
+            if not p_entries:
+                continue
+            raw_text += f"🕐 {p_name}:\n"
+            for e in p_entries:
+                raw_text += (f"   ⏰ {e['time']} → "
+                            f"🌡️{e['temp']:.0f}°C | "
+                            f"🌬️{e['wind_knots']:.0f}kn | "
+                            f"🌊{e['wave_h']:.1f}م | "
+                            f"{e['desc']}\n")
+            max_wind = max(e['wind_knots'] for e in p_entries)
+            raw_text += f"   {_marine_safety(max_wind)}\n\n"
+
+        # AI formatting via Gemini
         final_text = raw_text
         try:
             gemini_key = os.getenv("GEMINI_API_KEY")
             if gemini_key:
                 ai_url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={gemini_key}"
-                prompt = f"قم بصياغة تقرير الطقس هذا بأسلوب بحري مصري ودود ومختصر للقبطان:\\n{raw_text}"
+                prompt = (f"قم بصياغة تقرير الطقس البحري هذا بأسلوب بحري مصري ودود ومختصر للقبطان. "
+                         f"حافظ على كل الأرقام والفترات الزمنية وبيانات الرياح والموج كما هي:\n{raw_text}")
                 payload = {"contents": [{"parts": [{"text": prompt}]}]}
-                resp = requests.post(ai_url, json=payload, timeout=8)
+                resp = await loop.run_in_executor(
+                    None, lambda: requests.post(ai_url, json=payload, timeout=10)
+                )
                 if resp.status_code == 200:
                     ai_data = resp.json()
                     if "candidates" in ai_data and len(ai_data["candidates"]) > 0:
@@ -1477,10 +1805,34 @@ async def handle_weather(message: Message):
         except Exception as ai_err:
             logging.warning(f"Gemini weather summary failed: {ai_err}")
 
+        if len(final_text) > 4000:
+            final_text = final_text[:3990] + "\n\n... (مقطوع)"
         await wait_msg.edit_text(final_text)
     except Exception as e:
         logging.error(f"Weather error: {e}")
+        traceback.print_exc()
         await wait_msg.edit_text("مش قادر أوصل لبيانات الطقس حالياً. 😅")
+
+
+def _estimate_wave_height(wind_knots: float) -> tuple:
+    """Beaufort scale wind-to-wave height approximation for marine reports."""
+    if wind_knots < 1:    return 0.0, "هادئ تماماً 🏖️"
+    elif wind_knots < 4:  return 0.1, "هادئ 🏖️"
+    elif wind_knots < 7:  return 0.3, "أمواج خفيفة 🌊"
+    elif wind_knots < 11: return 0.6, "أمواج معتدلة 🌊"
+    elif wind_knots < 17: return 1.2, "أمواج متوسطة ⚠️"
+    elif wind_knots < 22: return 2.5, "أمواج عالية ⚠️"
+    elif wind_knots < 28: return 4.0, "أمواج عالية جداً 🚨"
+    else:                 return 6.0, "بحر هائج 🚨🚨"
+
+
+def _marine_safety(wind_knots: float) -> str:
+    """Marine trip safety assessment based on wind speed."""
+    if wind_knots < 10:   return "✅ آمن للإبحار — البحر هادي ومثالي للرحلات"
+    elif wind_knots < 17: return "⚠️ مناسب بحذر — الرياح معتدلة"
+    elif wind_knots < 22: return "⚠️ غير مستحب — الرياح قوية"
+    else:                 return "🚫 خطر — يُنصح بعدم الإبحار"
+
 
 # ─────────────────────────────────────────────────────────────
 # ADMIN APPROVAL CALLBACKS
