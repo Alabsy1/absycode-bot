@@ -1724,6 +1724,17 @@ async def handle_marine_office(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("أهلاً بك في مكتبك البحري! 🛳️", reply_markup=get_main_menu())
 
+@dp.message(F.text == "⚓ مركز قيادة المركب")
+async def handle_crew_command_center(message: Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 بحث في أسماء الطاقم", callback_data="crew_search")],
+        [InlineKeyboardButton(text="📢 إذاعة رسالة للطاقم", callback_data="crew_broadcast")],
+        [InlineKeyboardButton(text="➕ إضافة طاقم بـ ID", callback_data="crew_add")],
+        [InlineKeyboardButton(text="📄 عرض فواتير الطاقم", callback_data="crew_invoices")],
+    ])
+    await message.answer("⚓ **مركز قيادة المركب**\nاختر من القائمة:", reply_markup=kb, parse_mode='Markdown')
+
 @dp.message(F.text == "🌊 سجل السرحات")
 async def handle_trips_log(message: Message, state: FSMContext):
     await state.clear()
