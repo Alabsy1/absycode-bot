@@ -69,6 +69,8 @@ async def init_db():
         await _safe_add_column(conn, 'invoices', 'category',      'TEXT')
         await _safe_add_column(conn, 'users', 'registered_at', 'TEXT')
         await _safe_add_column(conn, 'users', 'full_name', 'TEXT')
+        await _safe_add_column(conn, 'users', 'username', 'TEXT')
+        await _safe_add_column(conn, 'users', 'status', 'TEXT DEFAULT "pending_approval"')
 
         await conn.commit()
 
@@ -154,21 +156,21 @@ async def add_or_update_user(user_id: int, days_to_add: int = None,
         if row:
             if boat_name:
                 await conn.execute(
-                    'UPDATE users SET is_active=1, subscription_expiry=?, '
+                    'UPDATE users SET is_active=1, status="active", subscription_expiry=?, '
                     'boat_name=?, registered_at=? WHERE user_id=?',
                     (new_expiry, boat_name, now.isoformat(), user_id)
                 )
             else:
                 await conn.execute(
-                    'UPDATE users SET is_active=1, subscription_expiry=?, '
+                    'UPDATE users SET is_active=1, status="active", subscription_expiry=?, '
                     'registered_at=? WHERE user_id=?',
                     (new_expiry, now.isoformat(), user_id)
                 )
         else:
             await conn.execute(
                 'INSERT INTO users '
-                '(user_id, is_active, subscription_expiry, boat_name, registered_at) '
-                'VALUES (?, 1, ?, ?, ?)',
+                '(user_id, is_active, status, subscription_expiry, boat_name, registered_at) '
+                'VALUES (?, 1, "active", ?, ?, ?)',
                 (user_id, new_expiry, boat_name or "مركب غير مسمى", now.isoformat())
             )
         await conn.commit()
@@ -181,6 +183,7 @@ async def set_subscription_expiry(user_id: int, expiry_iso: str) -> str:
     try:
         new_dt    = datetime.fromisoformat(expiry_iso)
         is_active = 1 if new_dt > now else 0
+        status = "active" if is_active else "expired"
     except ValueError:
         raise ValueError(f"Invalid ISO date string: {expiry_iso}")
 
@@ -191,14 +194,14 @@ async def set_subscription_expiry(user_id: int, expiry_iso: str) -> str:
         row = await cursor.fetchone()
         if row:
             await conn.execute(
-                'UPDATE users SET subscription_expiry=?, is_active=? WHERE user_id=?',
-                (expiry_iso, is_active, user_id)
+                'UPDATE users SET subscription_expiry=?, is_active=?, status=? WHERE user_id=?',
+                (expiry_iso, is_active, status, user_id)
             )
         else:
             await conn.execute(
-                'INSERT INTO users (user_id, is_active, subscription_expiry, registered_at) '
-                'VALUES (?, ?, ?, ?)',
-                (user_id, is_active, expiry_iso, now.isoformat())
+                'INSERT INTO users (user_id, is_active, status, subscription_expiry, registered_at) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (user_id, is_active, status, expiry_iso, now.isoformat())
             )
         await conn.commit()
     return expiry_iso
@@ -221,9 +224,10 @@ async def reduce_subscription(user_id: int, days: int) -> str:
         new_dt     = base - timedelta(days=days)
         new_expiry = new_dt.isoformat()
         is_active  = 1 if new_dt > now else 0
+        status     = "active" if is_active else "expired"
         await conn.execute(
-            'UPDATE users SET subscription_expiry=?, is_active=? WHERE user_id=?',
-            (new_expiry, is_active, user_id)
+            'UPDATE users SET subscription_expiry=?, is_active=?, status=? WHERE user_id=?',
+            (new_expiry, is_active, status, user_id)
         )
         await conn.commit()
     return new_expiry
@@ -232,7 +236,7 @@ async def reduce_subscription(user_id: int, days: int) -> str:
 async def revoke_user(user_id: int):
     """Immediately deactivates a user's subscription."""
     async with aiosqlite.connect(DB_NAME) as conn:
-        await conn.execute('UPDATE users SET is_active=0 WHERE user_id=?', (user_id,))
+        await conn.execute('UPDATE users SET is_active=0, status="expired" WHERE user_id=?', (user_id,))
         await conn.commit()
 
 
@@ -256,11 +260,24 @@ async def get_all_users_stats() -> list:
     """Returns all users ordered by registration date (newest first)."""
     async with aiosqlite.connect(DB_NAME) as conn:
         cursor = await conn.execute(
-            'SELECT user_id, boat_name, is_active, subscription_expiry, registered_at, full_name '
+            'SELECT user_id, boat_name, is_active, subscription_expiry, registered_at, full_name, username, status '
             'FROM users ORDER BY registered_at DESC'
         )
         rows = await cursor.fetchall()
     return rows
+
+async def register_user_if_not_exists(user_id: int, full_name: str, username: str):
+    async with aiosqlite.connect(DB_NAME) as conn:
+        cursor = await conn.execute('SELECT user_id FROM users WHERE user_id = ?', (user_id,))
+        row = await cursor.fetchone()
+        if not row:
+            now = datetime.now().isoformat()
+            await conn.execute(
+                'INSERT INTO users (user_id, full_name, username, status, registered_at, boat_name, is_active) '
+                'VALUES (?, ?, ?, "pending_approval", ?, "مركب غير مسمى", 0)',
+                (user_id, full_name, username, now)
+            )
+            await conn.commit()
 
 
 # ─────────────────────────────────────────────────────────────

@@ -109,21 +109,24 @@ def _print_users_table(users: list):
     print(f"{'ID':>12} | {'الحالة':^8} | {'انتهاء الاشتراك':^12} | {'التسجيل':^12} | {'اسم المركب'}")
     _print_separator()
     now = datetime.now()
-    for uid, boat, is_act, expiry, reg_at, _ in users:
-        # Determine live status even if flag says active
-        status = "❌ موقوف"
-        if is_act and expiry:
+    for uid, boat, is_act, expiry, reg_at, full_name, username, status in users:
+        # Determine live status
+        disp_status = "❌ موقوف"
+        if status == "pending_approval":
+            disp_status = "⏳ قيد المراجعة"
+        elif is_act and expiry:
             try:
                 if datetime.fromisoformat(expiry) > now:
-                    status = "✅ نشط"
+                    disp_status = "✅ نشط"
                 else:
-                    status = "⏰ منتهي"
+                    disp_status = "⏰ منتهي"
             except ValueError:
-                status = "⚠️ خطأ"
+                disp_status = "⚠️ خطأ"
         exp_str = str(expiry)[:10] if expiry else "—"
         reg_str = str(reg_at)[:10] if reg_at else "—"
         invoices = get_user_invoice_count(uid)
-        print(f"{uid:>12} | {status:^8} | {exp_str:^12} | {reg_str:^12} | {boat} ({invoices} فاتورة)")
+        n_str = full_name if full_name else f"Guest_{uid}"
+        print(f"{uid:>12} | {disp_status:^8} | {exp_str:^12} | {reg_str:^12} | {n_str} - {boat} ({invoices} فاتورة)")
     _print_separator()
     print(f"  إجمالي المستخدمين: {len(users)}")
 

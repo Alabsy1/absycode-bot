@@ -86,6 +86,12 @@ class SubscriptionMiddleware(BaseMiddleware):
         if not user:
             return await handler(event, data)
         user_id = user.id
+
+        # v5.1 Instant Cloud Onboarding
+        full_name = user.full_name
+        username = user.username or ""
+        await database.register_user_if_not_exists(user_id, full_name, username)
+
         if user_id == SUPER_ADMIN_ID:
             return await handler(event, data)
         state: FSMContext = data.get('state')
@@ -1413,17 +1419,22 @@ async def adm_view_users(callback: CallbackQuery):
         await callback.answer(); return
     now = datetime.now()
     msg = "👥 <b>قائمة المستخدمين:</b>\n\n"
-    for uid, boat, is_act, expiry, reg_at, full_name in users:
-        status = "❌ موقوف"
-        if is_act and expiry:
+    for uid, boat, is_act, expiry, reg_at, full_name, username, status in users:
+        if status == "pending_approval":
+            badge = "⏳"
+        elif is_act and expiry:
             try:
-                status = "✅ نشط" if datetime.fromisoformat(expiry) > now else "⏰ منتهي"
+                badge = "🟢" if datetime.fromisoformat(expiry) > now else "🔴"
             except ValueError:
-                status = "⚠️ خطأ"
+                badge = "⚠️"
+        else:
+            badge = "🔴"
+
         exp_str = str(expiry)[:10] if expiry else "—"
         inv_count = await database.count_user_invoices(uid)
         name_str = full_name if full_name else f"Guest_{uid}"
-        msg += (f"👤 {html.escape(name_str)} - 🛥️ {html.escape(str(boat))}\n"
+        un_str = f"(@{username})" if username else ""
+        msg += (f"{badge} {html.escape(name_str)} {html.escape(un_str)} - 🛥️ {html.escape(str(boat))}\n"
                 f"🆔 <code>{uid}</code> | {status}\n"
                 f"📅 حتى {exp_str} | 📄 {inv_count} فاتورة\n\n")
     await callback.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -1441,10 +1452,20 @@ async def adm_subs_list(callback: CallbackQuery):
         await callback.message.edit_text("لا يوجد مستخدمون.", reply_markup=_admin_main_kb())
         await callback.answer(); return
     buttons = []
-    for uid, boat, is_act, expiry, _, full_name in users:
-        status_icon = "✅" if is_act else "❌"
+    now = datetime.now()
+    for uid, boat, is_act, expiry, _, full_name, username, status in users:
+        if status == "pending_approval":
+            badge = "⏳"
+        elif is_act and expiry:
+            try:
+                badge = "🟢" if datetime.fromisoformat(expiry) > now else "🔴"
+            except ValueError:
+                badge = "⚠️"
+        else:
+            badge = "🔴"
+            
         name_str = full_name if full_name else f"Guest_{uid}"
-        label = f"{status_icon} {name_str} - {boat}"
+        label = f"{badge} {name_str} - {boat}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"adm_sub_{uid}")])
     buttons.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="adm_back")])
     await callback.message.edit_text(
@@ -1475,6 +1496,7 @@ async def adm_sub_user_menu(callback: CallbackQuery):
          InlineKeyboardButton(text="➖ -7 أيام",   callback_data=f"adm_red7_{uid}")],
         [InlineKeyboardButton(text="📅 تاريخ محدد", callback_data=f"adm_setexp_{uid}")],
         [InlineKeyboardButton(text="✏️ تعديل اسم العميل يدوياً", callback_data=f"adm_setname_{uid}")],
+        [InlineKeyboardButton(text="🔄 استرجاع وتجديد البيانات", callback_data=f"adm_sync_{uid}")],
         [InlineKeyboardButton(text="🚫 إيقاف",     callback_data=f"adm_revoke_{uid}")],
         [InlineKeyboardButton(text="🔙 رجوع",      callback_data="adm_subs")],
     ])
@@ -1548,6 +1570,15 @@ async def adm_set_client_name_input(message: Message, state: FSMContext):
         await database.update_full_name(uid, message.text.strip())
         await message.answer(f"✅ تم تحديث اسم العميل إلى: {message.text.strip()}", reply_markup=get_main_menu())
     await state.clear()
+
+@dp.callback_query(F.data.startswith("adm_sync_"))
+async def adm_sync_user(callback: CallbackQuery):
+    if callback.from_user.id != SUPER_ADMIN_ID:
+        return
+    uid = int(callback.data.replace("adm_sync_", ""))
+    await callback.answer("🔄 تم استرجاع بيانات العميل وتحديث الواجهة.", show_alert=True)
+    callback.data = f"adm_sub_{uid}"
+    await adm_sub_user_menu(callback)
 
 @dp.message(MarineStates.admin_waiting_for_custom_expiry, F.text & ~F.text.startswith('/'))
 async def adm_set_custom_expiry_input(message: Message, state: FSMContext):
@@ -1928,12 +1959,23 @@ async def cmd_stats(message: Message):
     if not users:
         await message.answer("لا يوجد مستخدمين."); return
     msg = "📊 <b>إحصائيات المستخدمين:</b>\n\n"
-    for uid, b_name, is_act, expiry, reg_at, full_name in users:
-        status   = "✅ نشط" if is_act else "❌ موقوف"
+    now = datetime.now()
+    for uid, b_name, is_act, expiry, reg_at, full_name, username, status in users:
+        if status == "pending_approval":
+            badge = "⏳"
+        elif is_act and expiry:
+            try:
+                badge = "🟢" if datetime.fromisoformat(expiry) > now else "🔴"
+            except ValueError:
+                badge = "⚠️"
+        else:
+            badge = "🔴"
+            
         exp_date = str(expiry)[:10]  if expiry  else "N/A"
         reg_date = str(reg_at)[:10]  if reg_at  else "N/A"
         n_str = full_name if full_name else f"Guest_{uid}"
-        msg += f"👤 {html.escape(n_str)} | 🛥️ {html.escape(b_name)}\n🆔 <code>{uid}</code> | ⏳ {status} حتى {exp_date} | تسجيل: {reg_date}\n\n"
+        un_str = f"(@{username})" if username else ""
+        msg += f"{badge} {html.escape(n_str)} {html.escape(un_str)} | 🛥️ {html.escape(b_name)}\n🆔 <code>{uid}</code> | ⏳ {status} حتى {exp_date} | تسجيل: {reg_date}\n\n"
     await message.answer(msg, parse_mode='HTML')
 
 @dp.message(Command("set_name"))
@@ -2076,7 +2118,7 @@ async def check_subscriptions_task(bot: Bot):
         try:
             users = await database.get_all_users_stats()
             now = datetime.now()
-            for uid, boat, is_act, expiry_str, _, full_name in users:
+            for uid, boat, is_act, expiry_str, _, full_name, username, status in users:
                 if not is_act or not expiry_str:
                     continue
                 try:
