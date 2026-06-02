@@ -68,6 +68,12 @@ class MarineStates(StatesGroup):
     # v4.0 — Merge target selection
     waiting_for_merge_target      = State()
 
+class VesselStates(StatesGroup):
+    waiting_for_vessel_name = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_custom_client_name = State()
+
 pending_approval_requests: set = set()
 pending_invoices: dict = {}
 
@@ -137,7 +143,7 @@ def get_main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="💰 الحسابات"),         KeyboardButton(text="🌤️ حالة البحر")],
             [KeyboardButton(text="➕ إضافة فاتورة"),     KeyboardButton(text="✏️ تعديل فاتورة")],
             [KeyboardButton(text="🗑️ مسح"),              KeyboardButton(text="📸 إضافة صورة الفاتورة")],
-            [KeyboardButton(text="📊 التقارير")]
+            [KeyboardButton(text="📊 التقارير"),         KeyboardButton(text="⚓ مركز قيادة المركب")]
         ],
         resize_keyboard=True,
         is_persistent=True
@@ -182,6 +188,7 @@ def get_category_keyboard() -> InlineKeyboardMarkup:
 @dp.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    await database.update_full_name(message.from_user.id, message.from_user.full_name)
     await message.answer(
         "مرحباً بك في بوت AbsyCode Marine Assistant! ⚓\n\n"
         "أنا هنا لمساعدتك في إدارة مركبك ورحلاتك وحساباتك بكل سهولة.\n"
@@ -1406,7 +1413,7 @@ async def adm_view_users(callback: CallbackQuery):
         await callback.answer(); return
     now = datetime.now()
     msg = "👥 <b>قائمة المستخدمين:</b>\n\n"
-    for uid, boat, is_act, expiry, reg_at in users:
+    for uid, boat, is_act, expiry, reg_at, full_name in users:
         status = "❌ موقوف"
         if is_act and expiry:
             try:
@@ -1415,8 +1422,9 @@ async def adm_view_users(callback: CallbackQuery):
                 status = "⚠️ خطأ"
         exp_str = str(expiry)[:10] if expiry else "—"
         inv_count = await database.count_user_invoices(uid)
-        msg += (f"🆔 <code>{uid}</code>\n"
-                f"🛥️ {html.escape(str(boat))} | {status}\n"
+        name_str = full_name if full_name else f"Guest_{uid}"
+        msg += (f"👤 {html.escape(name_str)} - 🛥️ {html.escape(str(boat))}\n"
+                f"🆔 <code>{uid}</code> | {status}\n"
                 f"📅 حتى {exp_str} | 📄 {inv_count} فاتورة\n\n")
     await callback.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 رجوع", callback_data="adm_back")]
@@ -1433,9 +1441,10 @@ async def adm_subs_list(callback: CallbackQuery):
         await callback.message.edit_text("لا يوجد مستخدمون.", reply_markup=_admin_main_kb())
         await callback.answer(); return
     buttons = []
-    for uid, boat, is_act, expiry, _ in users:
+    for uid, boat, is_act, expiry, _, full_name in users:
         status_icon = "✅" if is_act else "❌"
-        label = f"{status_icon} {uid} — {boat}"
+        name_str = full_name if full_name else f"Guest_{uid}"
+        label = f"{status_icon} {name_str} - {boat}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"adm_sub_{uid}")])
     buttons.append([InlineKeyboardButton(text="🔙 رجوع", callback_data="adm_back")])
     await callback.message.edit_text(
@@ -1465,6 +1474,7 @@ async def adm_sub_user_menu(callback: CallbackQuery):
         [InlineKeyboardButton(text="➕ +30 يوم",   callback_data=f"adm_ext30_{uid}"),
          InlineKeyboardButton(text="➖ -7 أيام",   callback_data=f"adm_red7_{uid}")],
         [InlineKeyboardButton(text="📅 تاريخ محدد", callback_data=f"adm_setexp_{uid}")],
+        [InlineKeyboardButton(text="✏️ تعديل اسم العميل يدوياً", callback_data=f"adm_setname_{uid}")],
         [InlineKeyboardButton(text="🚫 إيقاف",     callback_data=f"adm_revoke_{uid}")],
         [InlineKeyboardButton(text="🔙 رجوع",      callback_data="adm_subs")],
     ])
@@ -1521,6 +1531,23 @@ async def adm_set_custom_expiry_prompt(callback: CallbackQuery, state: FSMContex
         parse_mode='HTML'
     )
     await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_setname_"))
+async def adm_set_client_name_prompt(callback: CallbackQuery, state: FSMContext):
+    uid = int(callback.data.replace("adm_setname_", ""))
+    await state.set_state(AdminStates.waiting_for_custom_client_name)
+    await state.update_data(admin_target_uid=uid)
+    await callback.message.edit_text("✏️ أرسل اسم العميل الجديد:")
+    await callback.answer()
+
+@dp.message(AdminStates.waiting_for_custom_client_name, F.text & ~F.text.startswith('/'))
+async def adm_set_client_name_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    uid = data.get('admin_target_uid')
+    if uid:
+        await database.update_full_name(uid, message.text.strip())
+        await message.answer(f"✅ تم تحديث اسم العميل إلى: {message.text.strip()}", reply_markup=get_main_menu())
+    await state.clear()
 
 @dp.message(MarineStates.admin_waiting_for_custom_expiry, F.text & ~F.text.startswith('/'))
 async def adm_set_custom_expiry_input(message: Message, state: FSMContext):
@@ -1697,7 +1724,7 @@ async def process_finance_choice(callback: CallbackQuery, state: FSMContext):
         await state.set_state(MarineStates.waiting_for_expense_details)
         await callback.message.answer("ابعت تفاصيل المصروف أو صورة الفاتورة. ✍️")
     elif callback.data == "finance_reports":
-        await cmd_report(callback.message)
+        await _show_report_page(callback.message, callback.from_user.id, page=0)
     await callback.answer()
 
 
@@ -1901,20 +1928,25 @@ async def cmd_stats(message: Message):
     if not users:
         await message.answer("لا يوجد مستخدمين."); return
     msg = "📊 <b>إحصائيات المستخدمين:</b>\n\n"
-    for uid, b_name, is_act, expiry, reg_at in users:
+    for uid, b_name, is_act, expiry, reg_at, full_name in users:
         status   = "✅ نشط" if is_act else "❌ موقوف"
         exp_date = str(expiry)[:10]  if expiry  else "N/A"
         reg_date = str(reg_at)[:10]  if reg_at  else "N/A"
-        msg += f"👤 <code>{uid}</code> | 🛥️ {html.escape(b_name)}\n⏳ {status} حتى {exp_date} | تسجيل: {reg_date}\n\n"
+        n_str = full_name if full_name else f"Guest_{uid}"
+        msg += f"👤 {html.escape(n_str)} | 🛥️ {html.escape(b_name)}\n🆔 <code>{uid}</code> | ⏳ {status} حتى {exp_date} | تسجيل: {reg_date}\n\n"
     await message.answer(msg, parse_mode='HTML')
 
 @dp.message(Command("set_name"))
-async def cmd_set_name(message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("الاستخدام: /set_name <اسم المركب>"); return
-    await database.update_boat_name(message.from_user.id, args[1].strip())
-    await message.answer(f"✅ اسم مركبك: {args[1].strip()} 🛥️")
+async def cmd_set_name(message: Message, state: FSMContext):
+    await state.set_state(VesselStates.waiting_for_vessel_name)
+    await message.answer("📝 أرسل اسم المركب الجديد الآن:")
+
+@dp.message(VesselStates.waiting_for_vessel_name, F.text & ~F.text.startswith('/'))
+async def process_vessel_name(message: Message, state: FSMContext):
+    vessel_name = message.text.strip()
+    await database.update_boat_name(message.from_user.id, vessel_name)
+    await state.clear()
+    await message.answer(f"✅ تم تحديث اسم المركب بنجاح إلى: {vessel_name}")
 
 @dp.message(Command("last"))
 async def cmd_last(message: Message):
@@ -1970,6 +2002,11 @@ async def handle_text(message: Message, state: FSMContext):
         MarineStates.waiting_for_image_upload.state,
         MarineStates.waiting_for_invoice_category.state,
         MarineStates.admin_waiting_for_custom_expiry.state,
+        MarineStates.waiting_for_voice_correction.state,
+        MarineStates.waiting_for_report_edit_value.state,
+        MarineStates.waiting_for_merge_target.state,
+        VesselStates.waiting_for_vessel_name.state,
+        AdminStates.waiting_for_custom_client_name.state,
     ]:
         return
     # Delete shortcut
@@ -2034,6 +2071,42 @@ async def handle_text(message: Message, state: FSMContext):
 # ─────────────────────────────────────────────────────────────
 # STARTUP
 # ─────────────────────────────────────────────────────────────
+async def check_subscriptions_task(bot: Bot):
+    while True:
+        try:
+            users = await database.get_all_users_stats()
+            now = datetime.now()
+            for uid, boat, is_act, expiry_str, _, full_name in users:
+                if not is_act or not expiry_str:
+                    continue
+                try:
+                    expiry_date = datetime.fromisoformat(expiry_str)
+                    days_left = (expiry_date - now).days
+                    
+                    if days_left in [7, 3, 1]:
+                        try:
+                            await bot.send_message(
+                                uid,
+                                f"⚠️ تنبيه: اشتراكك سينتهي بعد {days_left} يوم. يرجى التجديد لتجنب الإيقاف."
+                            )
+                        except Exception:
+                            pass
+                    elif days_left == 2:
+                        try:
+                            name_str = full_name if full_name else f"Guest_{uid}"
+                            await bot.send_message(
+                                SUPER_ADMIN_ID,
+                                f"🚨 تنبيه للإدارة: اشتراك العميل {name_str} ({boat}) سينتهي بعد يومين (ID: {uid})."
+                            )
+                        except Exception:
+                            pass
+                except ValueError:
+                    pass
+        except Exception as e:
+            logging.error(f"check_subscriptions_task error: {e}")
+        
+        await asyncio.sleep(86400) # Wait 1 day
+
 async def setup_bot_commands(bot: Bot):
     await bot.set_my_commands([
         BotCommand(command="start",       description="بدء البوت"),
@@ -2048,8 +2121,9 @@ async def setup_bot_commands(bot: Bot):
 
 async def main():
     await database.init_db()
-    logging.info("Starting AbsyCode Marine Bot v3.0...")
+    logging.info("Starting AbsyCode Marine Bot v5.0...")
     await setup_bot_commands(bot)
+    asyncio.create_task(check_subscriptions_task(bot))
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

@@ -68,6 +68,7 @@ async def init_db():
         await _safe_add_column(conn, 'invoices', 'image_file_id', 'TEXT')
         await _safe_add_column(conn, 'invoices', 'category',      'TEXT')
         await _safe_add_column(conn, 'users', 'registered_at', 'TEXT')
+        await _safe_add_column(conn, 'users', 'full_name', 'TEXT')
 
         await conn.commit()
 
@@ -243,11 +244,19 @@ async def update_boat_name(user_id: int, boat_name: str):
         await conn.commit()
 
 
+async def update_full_name(user_id: int, full_name: str):
+    async with aiosqlite.connect(DB_NAME) as conn:
+        await conn.execute(
+            'UPDATE users SET full_name=? WHERE user_id=?', (full_name, user_id)
+        )
+        await conn.commit()
+
+
 async def get_all_users_stats() -> list:
     """Returns all users ordered by registration date (newest first)."""
     async with aiosqlite.connect(DB_NAME) as conn:
         cursor = await conn.execute(
-            'SELECT user_id, boat_name, is_active, subscription_expiry, registered_at '
+            'SELECT user_id, boat_name, is_active, subscription_expiry, registered_at, full_name '
             'FROM users ORDER BY registered_at DESC'
         )
         rows = await cursor.fetchall()

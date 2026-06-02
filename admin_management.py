@@ -109,7 +109,7 @@ def _print_users_table(users: list):
     print(f"{'ID':>12} | {'الحالة':^8} | {'انتهاء الاشتراك':^12} | {'التسجيل':^12} | {'اسم المركب'}")
     _print_separator()
     now = datetime.now()
-    for uid, boat, is_act, expiry, reg_at in users:
+    for uid, boat, is_act, expiry, reg_at, _ in users:
         # Determine live status even if flag says active
         status = "❌ موقوف"
         if is_act and expiry:
